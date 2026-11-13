@@ -345,7 +345,7 @@ def check_executables(root: Path, files: list[Path]) -> list[Finding]:
     expected = [
         path
         for path in files
-        if path.suffix in {".sh", ".py"} and (
+        if path.name != "__init__.py" and path.suffix in {".sh", ".py"} and (
             path.parent.name in {"scripts"}
             or path.name in {"run_app.sh", "run_ocr.sh", "rebuild_index_offline.sh", "build-vm.sh"}
         )
