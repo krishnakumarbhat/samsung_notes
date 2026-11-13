@@ -1,0 +1,15 @@
+# Core recall dashboard.  These are the versions verified on the reference
+# machine (2026-11-13).  Python 3.10-3.13.
+fastapi==0.141.1
+uvicorn==0.34.3
+pydantic==2.13.4
+pydantic-settings==2.10.1
+fsrs==5.1.3
+pypdf==6.7.1
+httpx==0.28.1
+python-multipart==0.0.22
+jinja2==3.1.6
+
+# Optional legacy JSON/Chroma path.  The app imports it lazily and falls back
+# to BM25 when it is absent, so it is not required for a fresh install.
+# chromadb==0.5.23

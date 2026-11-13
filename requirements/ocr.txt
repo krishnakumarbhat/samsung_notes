@@ -1,0 +1,12 @@
+# PaddleOCR bridge and lossless PDF compression.
+# The bootstrap installs paddlepaddle==3.2.0 (CPU) or paddlepaddle-gpu==3.2.0
+# separately so the common libraries stay identical.
+PyMuPDF==1.26.7
+pikepdf==10.3.0
+numpy==2.2.6
+Pillow==12.3.0
+cycler>=0.12.1
+paddleocr==3.4.0
+opencv-python-headless==5.0.0.93
+# paddlepaddle / paddlepaddle-gpu is installed by scripts/bootstrap.sh so the
+# CPU and CUDA variants share one requirements file.

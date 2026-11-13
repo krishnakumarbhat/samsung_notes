@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "generated_at": "2026-11-13T17:33:49+00:00",
+  "privacy": "Aggregate counts only; local paths and note names are not published.",
+  "groups": [
+    {
+      "name": "vm",
+      "files": 4,
+      "bytes": 34789343314
+    },
+    {
+      "name": "notes",
+      "files": 539,
+      "bytes": 12933185280
+    },
+    {
+      "name": "history",
+      "files": 160,
+      "bytes": 175120815
+    },
+    {
+      "name": "models",
+      "files": 11,
+      "bytes": 134411253
+    },
+    {
+      "name": "app_data",
+      "files": 16,
+      "bytes": 144205053
+    },
+    {
+      "name": "notes_mirror",
+      "files": 218,
+      "bytes": 132557
+    },
+    {
+      "name": "ocr_cache",
+      "files": 106,
+      "bytes": 360213
+    }
+  ],
+  "totals": {
+    "files": 1054,
+    "bytes": 48176758485
+  },
+  "reproducible_tool": [
+    {
+      "path": "tools/sdocx-cli",
+      "bytes": 14483368,
+      "mtime_ns": 1791868465060288900,
+      "mode": "0o755",
+      "type": "file",
+      "sha256": "5774317c8c80e52e694541788d4c0536b534ffccac3cb66c6781601249faa375"
+    }
+  ]
+}

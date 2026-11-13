@@ -1,0 +1,8 @@
+# Local semantic search: BGE-small runs on CPU so OCR can keep the 4 GB GPU.
+# Installing these adds roughly 2 GB; without them the indexer uses its
+# deterministic lexical-hashing embedder and every chunk is still searchable.
+torch==2.11.0
+transformers==4.57.6
+sentence-transformers==5.3.0
+numpy==2.2.6
+huggingface-hub==0.35.3

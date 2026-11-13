@@ -1,0 +1,6 @@
+# Test and repository tooling.  Playwright is optional and only needed for
+# the browser QA script; the unit suites skip it when absent.
+pytest==7.4.3
+pytest-asyncio==1.4.0
+playwright==1.63.0
+PyYAML>=6.0

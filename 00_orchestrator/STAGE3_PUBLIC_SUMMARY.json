@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "generated_at": "2026-10-20T19:19:29+05:30",
+  "stage": 3,
+  "status": "complete",
+  "privacy": "Aggregate-only summary; note identifiers, titles, paths, prompts and text are omitted.",
+  "corpus": {
+    "physical_pdfs": 274,
+    "compressed_pdfs": 274,
+    "indexed_sources": 274,
+    "processed": 274,
+    "searchable": 248,
+    "empty": 26,
+    "unreadable": 0,
+    "chunks": 10541,
+    "searchable_pct": 91,
+    "processed_pct": 100,
+    "embedding": "semantic",
+    "retrieval": "local-only"
+  },
+  "browser_qa": {
+    "viewport": "1440x900",
+    "horizontal_overflow": false,
+    "sources_total": 274,
+    "console_errors": 0,
+    "page_errors": 0,
+    "http_errors": 0
+  },
+  "tests": {
+    "total": 92,
+    "passed": 92,
+    "failed": 0,
+    "suites": {
+      "app": 47,
+      "pdf_pipeline": 31,
+      "ocr": 11,
+      "guest_setup": 3
+    }
+  },
+  "security": {
+    "repository_env_keys_blank": true,
+    "retrieval_local_only": true
+  }
+}

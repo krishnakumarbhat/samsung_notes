@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recall — study workstation</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#111c2e">
+<meta name="application-name" content="Recall">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Recall">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="/static/icon-192.png" sizes="192x192">
+<link rel="stylesheet" href="/static/vendor/tailwind.min.css">
+<link rel="stylesheet" href="/static/workstation.css">
+<link rel="stylesheet" href="/static/vendor/highlight.min.css">
+<!-- Local vendor assets only (CSP: self + inline; offline). KaTeX fonts resolve
+     relative to /static/vendor/. Optional math rendering; app works without it. -->
+<link rel="stylesheet" href="/static/vendor/katex.min.css">
+<script src="/static/vendor/katex.min.js" defer></script>
+<script src="/static/vendor/auto-render.min.js" defer></script>
+<script src="/static/vendor/highlight.min.js" defer></script>
+<script src="/static/workstation.js" defer></script>
+<script src="/static/flow.js" defer></script>
+<script src="/static/games.js" defer></script>
+</head>
+<body>
+<header>
+  <button class="mobile-source-toggle" onclick="document.body.classList.toggle('sources-open')" aria-label="Toggle sources">Sources</button>
+  <div class="brand">
+    <div class="wordmark">Re<em>call</em></div>
+    <div class="tagline">your notes, quizzed back at you — spaced repetition built in</div>
+  </div>
+  <div id="activitypill" class="activitypill"></div>
+  <div id="duepill" class="duepill" role="status" aria-live="polite">
+    <span id="duetxt"></span>
+    <button onclick="app.showTab('quiz')">Review</button>
+  </div>
+  <div class="ctxcontrols">
+    <button id="traveltoggle" class="ctxbtn" type="button" onclick="bank.toggleTravel()"
+            aria-pressed="false" title="Hide paper calculations; postpone them 24 h with no memory penalty">
+      <span aria-hidden="true">🚶</span><span id="traveltxt">Travel / Commute</span>
+    </button>
+    <button class="ctxbtn" type="button" onclick="bank.openSync()" title="Pool status, deck transfer and generation">
+      <span aria-hidden="true">⇅</span><span>Sync</span>
+    </button>
+  </div>
+</header>
+
+<div id="shell">
+<aside id="rail">
+  <div class="raillabel">Sources</div>
+  <div class="upbtns">
+    <button onclick="app.selectVisible()">Select visible</button>
+    <button onclick="app.clearSources()">Clear selection</button>
+  </div>
+  <label class="raillabel" for="sourcefilter">Search notes</label>
+  <input id="sourcefilter" type="search" placeholder="Title or folder…" aria-label="Search notes">
+  <select id="sourcefolder" aria-label="Filter source folder"><option value="">All folders</option></select>
+  <div id="selectioncount" class="hint"></div>
+  <input type="file" id="folder" webkitdirectory multiple hidden>
+  <input type="file" id="files" accept=".pdf,.md,.txt" multiple hidden>
+  <div id="ingeststat"></div>
+  <div id="srclist"></div>
+</aside>
+
+<div id="main">
+  <nav>
+    <button data-p="quiz" class="on">Quiz</button>
+    <button data-p="bank">Bank</button>
+    <button data-p="games">Games</button>
+    <button data-p="tutor">Tutor</button>
+    <button data-p="studio">Studio</button>
+    <button data-p="progress">Progress</button>
+    <button data-p="history">History</button>
+  </nav>
+
+  <!-- Quiz / Exam pane -->
+  <section id="p-quiz" class="pane on" aria-label="Quiz and exam mode">
+    <div id="quiztoolbar" class="quiz-toolbar">
+      <label for="quizscope">Practice scope</label>
+      <select id="quizscope"><option>Daily Adaptive Mix</option></select>
+      <div class="mode-pills">
+        <button class="modepill" onclick="app.setMode('practice')" title="Practice (feedback revealed)">Practice</button>
+        <button class="modepill" onclick="app.setMode('exam')" title="Exam (silent, timed)">Exam</button>
+      </div>
+      <button class="pri" onclick="app.startQuiz()">Start 25-question test</button>
+      <button class="ghost" onclick="app.openPdfDrawer(null)">Open source PDF</button>
+    </div>
+    <div id="quizcard"></div>
+  </section>
+
+  <!-- Question bank / mobile study pane -->
+  <section id="p-bank" class="pane" aria-label="Question bank, flow rating and mobile sync">
+    <div class="bank-toolbar">
+      <span id="bankstat" class="bankstat" role="status" aria-live="polite">Loading pool…</span>
+      <button class="ghost" type="button" onclick="bank.loadQueue()">Refresh queue</button>
+      <button class="ghost" type="button" onclick="bank.openSync()">Sync &amp; deck</button>
+    </div>
+    <div id="banknotice" class="banknotice" role="status" aria-live="polite"></div>
+    <div id="bankcard"></div>
+  </section>
+
+  <!-- Topic-personalised games pane -->
+  <section id="p-games" class="pane" aria-label="Topic-personalised study games">
+    <div class="games-toolbar">
+      <label for="gametopic">Topic</label>
+      <select id="gametopic" aria-label="Topic used to personalise the games"><option value="">All topics</option></select>
+      <button class="ghost" type="button" onclick="games.refreshTopics()">Refresh topics</button>
+      <span id="gamebest" class="gamebest" role="status" aria-live="polite">No rounds yet.</span>
+    </div>
+    <div id="gamesnotice" class="banknotice" role="status" aria-live="polite"></div>
+    <div id="gameshub" class="gameshub"></div>
+    <div id="gameout" class="gameout" hidden></div>
+  </section>
+
+  <!-- Tutor pane -->
+  <section id="p-tutor" class="pane" aria-label="Tutor step-by-step">
+    <div id="tutorchat" class="chatlog"></div>
+    <div id="tutorinputrow">
+      <input type="text" id="tutorq" placeholder="Ask your notes anything…">
+      <button class="pri" id="tutorsend" onclick="app.askTutor()">Ask</button>
+    </div>
+    <div class="hint">one verification question at a time · nothing revealed until you grade</div>
+  </section>
+
+  <!-- Studio pane -->
+  <section id="p-studio" class="pane" aria-label="Studio generators">
+    <div class="studio-toolbar">
+      <label>Generate</label>
+      <button class="studiobtn" onclick="app.studio('chat')">Chat</button>
+      <button class="studiobtn" onclick="app.studio('cheatsheet')">Cheatsheet</button>
+      <button class="studiobtn" onclick="app.studio('traps')">Traps</button>
+      <button class="studiobtn" onclick="app.studio('compare')">Compare</button>
+    </div>
+    <div id="studioinput">
+      <input type="text" id="studioq" placeholder="Question or topic…">
+      <button class="pri" onclick="app.runStudio()">Go</button>
+    </div>
+    <div id="studioout"></div>
+  </section>
+
+  <!-- Progress pane -->
+  <section id="p-progress" class="pane" aria-label="Progress and mastery">
+    <div class="grid2">
+      <div class="panel">
+        <div class="raillabel">Concept graph</div>
+        <div class="graphwrap" id="graphwrap">
+          <canvas id="gcanvas"></canvas>
+          <div class="graphhint" id="graphhint">Click a node to scope quizzes to that concept.</div>
+        </div>
+      </div>
+      <div class="panel progress-panel">
+        <div class="raillabel">Coverage &amp; mastery by folder</div>
+        <div id="coverage"></div>
+        <hr>
+        <div class="raillabel">Mastery by concept</div>
+        <div id="topics"></div>
+        <div id="intelligence" class="intel"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- History pane -->
+  <section id="p-history" class="pane" aria-label="Study history">
+    <div id="histwrap"></div>
+  </section>
+</div>
+</div>
+
+<!-- PDF iframe drawer (split screen) -->
+<div id="pdfdrawer" class="drawer" aria-hidden="true" role="dialog" aria-modal="true">
+  <div class="drawerbar">
+    <span id="pdftitle" class="pdftitle"></span>
+    <button class="ghost" onclick="app.closePdfDrawer()">Close</button>
+  </div>
+  <div class="pdfframewrap">
+    <iframe id="pdfframe" src="about:blank" title="Source PDF page" allowfullscreen></iframe>
+  </div>
+</div>
+
+<!-- Sync management modal -->
+<div id="syncmodal" class="modal" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="synctitle">
+  <div class="modalbox">
+    <div class="modalhead">
+      <h2 id="synctitle">Study deck sync</h2>
+      <button class="ghost" type="button" onclick="bank.closeSync()">Close</button>
+    </div>
+    <div id="syncstats" class="syncstats"></div>
+    <div id="networkinfo" class="networkinfo" aria-live="polite"></div>
+    <div class="syncactions">
+      <button class="pri" type="button" onclick="bank.generate(50)">Generate 50 More Questions</button>
+      <button class="ghost" type="button" onclick="bank.syncMobile()">Sync Mobile</button>
+      <button class="ghost" type="button" onclick="bank.downloadDeck()">Download Offline Study Deck (.json)</button>
+      <label class="ghost filelabel">Upload Study Progress (.json)
+        <input type="file" id="progressfile" accept="application/json,.json" hidden>
+      </label>
+    </div>
+    <div id="syncprogress" class="syncprogress" role="status" aria-live="polite"></div>
+    <p class="hint">The deck is cached in this browser (IndexedDB). Answers made offline upload automatically on reconnect.</p>
+  </div>
+</div>
+
+<!-- Global toast -->
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+</body>
+</html>

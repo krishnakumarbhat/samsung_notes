@@ -1,0 +1,6 @@
+# Incremental Samsung Notes exporter, page delta and PDF repair.
+# PyMuPDF is imported through 03_rtx_compression_ocr/pymupdf_compat.py.
+PyMuPDF==1.26.7
+pikepdf==10.3.0
+numpy==2.2.6
+pillow==12.3.0

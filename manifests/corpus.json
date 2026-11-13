@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "generated_at": "2026-11-13T17:04:06+00:00",
+  "root": "02_extracted_notes_pdf/notes/original",
+  "totals": {
+    "files": 266,
+    "pages": 8938,
+    "text_chars": 7039804,
+    "searchable": 128,
+    "empty": 138,
+    "unreadable": 0,
+    "bytes": 7461106108
+  },
+  "files": [],
+  "privacy": "Per-file names omitted; use --include-paths for a private local manifest."
+}
