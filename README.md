@@ -4,9 +4,9 @@ A reproducible, local-first pipeline that exports Samsung Notes from a Windows
 VM, repairs legacy PDF exports, adds a searchable OCR layer, indexes the whole
 corpus offline, and serves a Socratic study dashboard with FSRS scheduling.
 
-The repository contains **code, configuration, evidence and metadata**. The
-personal note PDFs, the 34 GB VM disk and model weights stay local; their
-checksums and restore instructions are committed instead. See
+The repository contains **code, configuration, sanitized evidence and
+aggregate metadata**. Personal note PDFs, the VM disk and model weights stay
+local; model/tool checksums and restore instructions are committed. See
 [`REPLICATION.md`](REPLICATION.md) to rebuild everything on a new OS.
 
 [![CI](https://github.com/krishnakumarbhat/samsung_notes/actions/workflows/ci.yml/badge.svg)](https://github.com/krishnakumarbhat/samsung_notes/actions/workflows/ci.yml)
@@ -74,14 +74,14 @@ preserves the previous export.
 
 | Path | Responsibility |
 |---|---|
-| [`00_orchestrator/`](00_orchestrator/) | One-click sync/export/OCR/index runner, runtime resolver, stage reports |
+| [`00_orchestrator/`](00_orchestrator/) | One-click sync/export/OCR/index runner, runtime resolver, sanitized aggregate evidence |
 | [`01_vm_windows_sync/`](01_vm_windows_sync/) | QEMU Windows VM, Samsung Notes guest automation, sync quiescence checks |
 | [`02_extracted_notes_pdf/`](02_extracted_notes_pdf/) | Incremental exporter, page deltas, PDF repair, export state |
 | [`03_rtx_compression_ocr/`](03_rtx_compression_ocr/) | PaddleOCR bridge, invisible text layer, lossless compression |
 | [`04_learning_recall_app/`](04_learning_recall_app/) | FastAPI dashboard, FSRS, quiz bank, local hybrid retrieval |
 | [`05_environments_and_venvs/`](05_environments_and_venvs/) | Environment notes, model metadata, reinstall recipes |
 | [`scripts/`](scripts/) | Bootstrap, doctor, test runner, manifests, transfer bundle, hygiene gate |
-| [`manifests/`](manifests/) | Corpus/model/environment metadata and SHA-256 asset inventory |
+| [`manifests/`](manifests/) | Aggregate corpus/asset metadata, model pin and portable environment record |
 | [`docs/`](docs/) | Architecture, research decisions, assets, evidence index, troubleshooting |
 
 ## Tests
@@ -107,8 +107,8 @@ directory.
   **99 MB** tracked-file ceiling and warns above 50 MB.
 - The note corpus is personal data. Keep transfer bundles on encrypted media and
   do not paste note text into public issues.
-- Credentials live in `~/.config/sam_win/.env` (mode 0600). The repository
-  `.env` files contain blank placeholders.
+- Credentials live in `~/.config/sam_win/.env` (mode 0600). Tracked
+  `.env.example` files contain placeholders only.
 
 ## Reproduce on a new machine
 
@@ -138,7 +138,7 @@ are manual by design.
 - [`docs/DATA_AND_ASSETS.md`](docs/DATA_AND_ASSETS.md) — asset inventory,
   exclusions, checksums and transfer options.
 - [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — known failures and fixes.
-- [`docs/EVIDENCE_INDEX.md`](docs/EVIDENCE_INDEX.md) — every report and what it proves.
+- [`docs/EVIDENCE_INDEX.md`](docs/EVIDENCE_INDEX.md) — public evidence and reproducible checks.
 
 ## Known limitations
 
