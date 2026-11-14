@@ -12,7 +12,7 @@ import json
 import time
 from datetime import datetime, timezone
 
-from . import db, flow_scheduler, fsrs_bridge, interleaving
+from . import db, elo, flow_scheduler, fsrs_bridge, interleaving
 
 MAX_DECK_BYTES = 2_000_000
 MAX_BATCH_BYTES = 1_500_000
@@ -157,6 +157,8 @@ def push_reviews(reviews: list[dict], *, path: str | None = None,
     accepted = duplicates = 0
     errors: list[str] = []
     fsrs: list[dict] = []
+    results: list[dict] = []
+    rating: dict | None = None
     momentum: dict | None = None
     connection = db.open_database(path)
     try:
@@ -165,15 +167,21 @@ def push_reviews(reviews: list[dict], *, path: str | None = None,
                 review = _validate_review(raw)
             except (ValueError, TypeError) as error:
                 errors.append(f"review {index}: {error}")
+                results.append({"client_id": raw.get("client_id") if isinstance(raw, dict) else None,
+                                "status": "rejected"})
                 continue
             question = connection.execute(
-                """SELECT id,concept_id,topic_folder,correct_index,status
+                """SELECT id,concept_id,topic_folder,correct_index,status,difficulty_tier
                    FROM quiz_bank WHERE id=?""", (review["quiz_id"],)).fetchone()
             if not question:
                 errors.append(f"review {index}: unknown quiz_id {review['quiz_id']}")
+                results.append({"client_id": review["client_id"], "status": "rejected"})
                 continue
             correct = int(review["user_selection"] == int(question["correct_index"])) \
                 if review["user_selection"] is not None else 0
+            # The outcome, not only the feeling, decides the memory grade.
+            review["fsrs_grade"] = fsrs_bridge.grade_for_review(
+                review["flow_rating"], bool(correct))
             cursor = connection.execute(
                 """INSERT OR IGNORE INTO flow_review_logs
                 (quiz_id,user_selection,is_correct,time_spent_seconds,flow_rating,
@@ -188,6 +196,7 @@ def push_reviews(reviews: list[dict], *, path: str | None = None,
             )
             if cursor.rowcount == 0:
                 duplicates += 1
+                results.append({"client_id": review["client_id"], "status": "duplicate"})
                 continue
             connection.commit()
             try:
@@ -203,9 +212,21 @@ def push_reviews(reviews: list[dict], *, path: str | None = None,
                                    (cursor.lastrowid,))
                 connection.commit()
                 errors.append(f"review {index}: fsrs update failed ({type(error).__name__})")
+                results.append({"client_id": review["client_id"], "status": "retry"})
                 continue
             fsrs.append(result)
             accepted += 1
+            results.append({"client_id": review["client_id"], "status": "accepted"})
+            try:
+                rating = elo.record(
+                    connection, quiz_id=review["quiz_id"],
+                    topic_folder=str(question["topic_folder"] or ""),
+                    difficulty_tier=int(question["difficulty_tier"]),
+                    correct=bool(correct), when=review["reviewed_at"])
+                connection.commit()
+            except Exception:
+                # Ratings are derived data; never lose an accepted review for them.
+                connection.rollback()
             try:
                 interleaving.resolve_weakness(review["quiz_id"], bool(correct), path=path)
             except Exception:
@@ -227,6 +248,8 @@ def push_reviews(reviews: list[dict], *, path: str | None = None,
         "errors": errors[:5],
         "fsrs": fsrs[-5:],
         "session": momentum,
+        "results": results,
+        "elo": rating,
     }
 
 
@@ -234,3 +257,33 @@ def deck_for_download(limit: int = DEFAULT_DECK_LIMIT, mode: str = "all",
                       path: str | None = None) -> dict:
     """Build a complete deck without changing any status (manual file export)."""
     return pull_deck(limit, mode, path=path, mark=False, include_synced=True)
+
+
+def state(*, path: str | None = None, since: float = 0.0) -> dict:
+    """What a device needs to reconcile with the host.
+
+    ``answered_ids`` lets a phone drop questions that were answered on another
+    device; ``recycled_ids`` are answered questions that are due again and may
+    be served; ``elo`` is the rating snapshot shown on the dashboard.
+    """
+    moment = time.time()
+    connection = db.open_database(path)
+    try:
+        answered = [int(row["id"]) for row in connection.execute(
+            "SELECT id FROM quiz_bank WHERE status='ANSWERED' ORDER BY id")]
+        postponed = [int(row["id"]) for row in connection.execute(
+            "SELECT id FROM quiz_bank WHERE status='POSTPONED' AND COALESCE(postponed_until,0)>?",
+            (moment,))]
+        reviews = int(connection.execute("SELECT COUNT(*) FROM flow_review_logs").fetchone()[0])
+    finally:
+        connection.close()
+    due_again = [int(item["id"]) for item in flow_scheduler.candidates(
+        path=path, now=moment, recycle=True) if item.get("recycled")]
+    return {
+        "server_time": datetime.fromtimestamp(moment, timezone.utc).isoformat(),
+        "answered_ids": answered,
+        "postponed_ids": postponed,
+        "recycled_ids": due_again,
+        "reviews_logged": reviews,
+        "elo": elo.snapshot(path, moment),
+    }

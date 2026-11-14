@@ -16,7 +16,7 @@ from pathlib import Path
 
 from src.config import RECALL_DB
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS quiz_bank(
@@ -109,6 +109,25 @@ CREATE INDEX IF NOT EXISTS session_weakness_session_idx
     ON session_weakness(session_id, resolved, concept_id);
 CREATE INDEX IF NOT EXISTS session_weakness_variant_idx
     ON session_weakness(variant_quiz_id);
+
+-- Elo ratings: scope 'learner' (key '*' = overall, else a study domain) and
+-- scope 'question' (key = quiz id).  Learner decay is computed on read from
+-- ``last_active``, so no nightly job is needed and sync replays are safe.
+CREATE TABLE IF NOT EXISTS elo_ratings(
+    scope TEXT NOT NULL CHECK(scope IN ('learner','question')),
+    key TEXT NOT NULL,
+    rating REAL NOT NULL,
+    games INTEGER NOT NULL DEFAULT 0,
+    last_active REAL NOT NULL,
+    PRIMARY KEY(scope, key)
+);
+CREATE TABLE IF NOT EXISTS elo_daily(
+    day TEXT NOT NULL,
+    key TEXT NOT NULL,
+    rating REAL NOT NULL,
+    reviews INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(day, key)
+);
 
 -- Created by src.review too; repeated here so the factory CLI works on a
 -- database the web app has never opened.  Additive only, identical columns.

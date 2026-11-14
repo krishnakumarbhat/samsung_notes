@@ -12,10 +12,12 @@ behaviours are enforced here:
 from __future__ import annotations
 
 import json
+import random
 import time
+import zlib
 from datetime import datetime, timezone
 
-from . import db, fsrs_bridge, interleaving
+from . import db, elo, fsrs_bridge, interleaving
 
 ROTATION = ("INTUITION", "CALCULATION_STEP", "ADVERSARIAL_TRAP", "SYSTEM_APPLICATION")
 FLOW_DELTA = {1: 1.5, 2: 0.5, 3: 0.0, 4: -0.5, 5: -1.5}
@@ -25,6 +27,33 @@ UP_THRESHOLD = 1.0
 DOWN_THRESHOLD = -1.0
 BASE_TIER = 3
 TRAVEL_POSTPONE_HOURS = 24.0
+# Randomised ranking (only when a seed is supplied; the unseeded order is the
+# original deterministic one).  Weights are on a common 0..1 scale per term.
+W_BOOSTED = 3.0
+W_OVERDUE = 2.0
+W_ELO_MATCH = 1.0
+W_TIER = 0.5
+W_RECYCLED = -0.75
+TEMPERATURE = 0.45
+RECYCLE_REST_HOURS = 20.0
+
+
+def daily_seed(session_id: str = "default", path: str | None = None,
+               now: float | None = None) -> int:
+    """Seed that is stable while a batch is being answered and new afterwards.
+
+    It mixes the UTC day, the session and the number of logged reviews, so a
+    page refresh keeps the order, the next batch gets a new one, and no two
+    days repeat a sequence.
+    """
+    moment = time.time() if now is None else float(now)
+    day = datetime.fromtimestamp(moment, timezone.utc).strftime("%Y-%m-%d")
+    connection = db.open_database(path)
+    try:
+        reviews = int(connection.execute("SELECT COUNT(*) FROM flow_review_logs").fetchone()[0])
+    finally:
+        connection.close()
+    return zlib.crc32(f"{day}|{session_id}|{reviews}".encode())
 
 
 def flow_delta(flow_rating: int) -> float:
@@ -130,8 +159,21 @@ def _due_of(connection, concept_id: str, now: float) -> float:
 
 
 def candidates(*, mode: str = "all", session_id: str = "default",
-               path: str | None = None, now: float | None = None) -> list[dict]:
-    """Return servable questions ordered by urgency and tier distance."""
+               path: str | None = None, now: float | None = None,
+               seed: int | None = None, recycle: bool = False) -> list[dict]:
+    """Return servable questions ordered by urgency and tier distance.
+
+    With ``seed`` the order is a seeded sample instead of a fixed sort: each
+    question gets a score (failed-twice boost, FSRS overdue, how close its
+    predicted success is to the session's target, tier distance) plus Gumbel
+    noise, which samples without replacement in proportion to
+    ``exp(score / TEMPERATURE)``.  Urgent material still comes first on
+    average, but two sessions never see the same sequence.
+
+    With ``recycle`` an already answered question returns once its concept is
+    due again and it has rested ``RECYCLE_REST_HOURS``; otherwise a small bank
+    runs dry and due concepts have nothing to be tested with.
+    """
     moment = time.time() if now is None else float(now)
     revive_postponed(path=path, now=moment)
     connection = db.open_database(path)
@@ -149,6 +191,20 @@ def candidates(*, mode: str = "all", session_id: str = "default",
             [moment, *params],
         ).fetchall()
         items = [dict(row) for row in rows]
+        if recycle:
+            travel = " AND q.requires_scratchpad=0" if mode == "travel" else ""
+            rested = moment - RECYCLE_REST_HOURS * 3600.0
+            for row in connection.execute(
+                    f"""SELECT q.*, f.due AS concept_due
+                        FROM quiz_bank q JOIN fsrs_cards f ON f.topic=q.concept_id
+                        WHERE q.status='ANSWERED' AND f.due<=?{travel}
+                          AND NOT EXISTS (
+                              SELECT 1 FROM flow_review_logs r WHERE r.quiz_id=q.id
+                              AND (julianday(r.reviewed_at)-2440587.5)*86400.0>?)""",
+                    (moment, rested)):
+                item = dict(row)
+                item["recycled"] = True
+                items.append(item)
         for item in items:
             # The HTTP queue mirrors the deck payload: options are a list, not
             # a JSON string, so the browser never has to parse storage details.
@@ -159,13 +215,39 @@ def candidates(*, mode: str = "all", session_id: str = "default",
         boosted = {str(row["concept_id"]) for row in connection.execute(
             """SELECT DISTINCT concept_id FROM session_weakness
                WHERE priority=1 AND resolved=1""")}
-        items.sort(key=lambda item: (
-            str(item["concept_id"]) not in boosted,
-            item["concept_due"] > moment,
-            float(item["concept_due"]),
-            abs(int(item["difficulty_tier"]) - tier),
-            int(item["id"]),
-        ))
+        if seed is None:
+            items.sort(key=lambda item: (
+                str(item["concept_id"]) not in boosted,
+                item["concept_due"] > moment,
+                float(item["concept_due"]),
+                abs(int(item["difficulty_tier"]) - tier),
+                int(item["id"]),
+            ))
+            return items
+        generator = random.Random(int(seed))
+        learned = elo.question_ratings(connection)
+        target = elo.success_target(tier)
+        learners: dict[str, float] = {}
+        items.sort(key=lambda item: int(item["id"]))  # fixed draw order per seed
+        for item in items:
+            domain = interleaving.domain_of(str(item.get("topic_folder", "")))
+            if domain not in learners:
+                learners[domain] = elo.rating_for_domain(connection, domain, moment)
+            rating = learned.get(int(item["id"]), elo.tier_rating(int(item["difficulty_tier"])))
+            chance = elo.expected(learners[domain], rating)
+            item["elo"] = round(rating)
+            item["predicted_success"] = round(chance, 3)
+            item["_score"] = (
+                W_BOOSTED * (str(item["concept_id"]) in boosted)
+                + W_OVERDUE * (float(item["concept_due"]) <= moment)
+                + W_ELO_MATCH * elo.match_score(chance, target)
+                + W_TIER * (1.0 - abs(int(item["difficulty_tier"]) - tier) / 4.0)
+                + W_RECYCLED * bool(item.get("recycled"))
+                + TEMPERATURE * elo.gumbel(generator.random())
+            )
+        items.sort(key=lambda item: (-item["_score"], int(item["id"])))
+        for item in items:
+            del item["_score"]
         return items
     finally:
         connection.close()
@@ -257,16 +339,20 @@ def postpone_quiz(quiz_id: int, *, hours: float = TRAVEL_POSTPONE_HOURS,
 
 
 def build_queue(*, limit: int = 25, mode: str = "all", session_id: str = "default",
-                path: str | None = None, postpone_travel: bool = True) -> dict:
+                path: str | None = None, postpone_travel: bool = True,
+                seed: int | None = None, recycle: bool = False) -> dict:
     """Return the interleaved queue plus the session state that shaped it."""
     if mode not in ("all", "travel"):
         raise ValueError("mode must be 'all' or 'travel'")
     postponed = apply_travel_postponement(path) if mode == "travel" and postpone_travel else 0
     state = session_state(session_id, path)
-    items = candidates(mode=mode, session_id=session_id, path=path)
+    items = candidates(mode=mode, session_id=session_id, path=path,
+                       seed=seed, recycle=recycle)
     queue = interleaving.build_session(items, max(1, int(limit)))
     return {
         "mode": mode,
+        "seed": seed,
+        "recycled": sum(1 for item in queue if item.get("recycled")),
         "session": state,
         "available": len(items),
         "postponed": postponed,

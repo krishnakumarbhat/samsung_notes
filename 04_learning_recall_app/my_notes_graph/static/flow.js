@@ -20,6 +20,10 @@ const bank = (() => {
   const DB_NAME = 'recall-offline';
   const DB_VERSION = 2;
   const GRADE = { 1: 4, 2: 3, 3: 3, 4: 2, 5: 1 };
+  // Mirrors engine.fsrs_bridge.grade_for_review: the outcome decides the grade.
+  function gradeFor(flowRating, correct) {
+    return correct ? Math.max(2, GRADE[flowRating]) : 1;
+  }
   const RATING_LABELS = {
     1: ['😴', 'Too Easy'], 2: ['😌', 'Comfortable'], 3: ['⚡', 'Flow State'],
     4: ['🧗', 'Challenging'], 5: ['🤯', 'Overwhelmed']
@@ -34,8 +38,11 @@ const bank = (() => {
     mode: readTravel() ? 'travel' : 'all',
     session: localStorage.getItem('recall.session') || 'web-' + shortId(),
     queue: [], pos: 0, current: null, answered: false,
-    askedAt: 0, busy: false, offline: false, lastStats: null, pollTimer: null, savedAt: 0
+    askedAt: 0, busy: false, offline: false, lastStats: null, pollTimer: null, savedAt: 0,
+    order: [0, 1, 2, 3], elo: null
   };
+  // Keep one session id per device so momentum and the daily seed survive reloads.
+  try { localStorage.setItem('recall.session', B.session); } catch (_) { /* private mode */ }
 
   /* ---------- tiny helpers ---------- */
   function $(selector) { return document.querySelector(selector); }
@@ -81,6 +88,9 @@ const bank = (() => {
     const response = await fetch(path, init);
     let payload = null;
     try { payload = await response.json(); } catch (_) { /* non-JSON */ }
+    if (response.status === 401) {
+      notice('This device is not paired with the laptop. Open /pair and enter the pairing code.', true);
+    }
     if (!response.ok) {
       const detail = payload && (payload.detail || payload.error);
       throw new Error(typeof detail === 'string' ? detail : `HTTP ${response.status}`);
@@ -186,6 +196,74 @@ const bank = (() => {
       : 'Desk mode on — full question bank');
   }
 
+  /* ---------- randomisation ---------- */
+  function daySalt() {
+    return Number(new Date().toISOString().slice(0, 10).replace(/-/g, ''));
+  }
+  function mix(value, salt) {
+    // 32-bit integer hash: a stable per-day shuffle key for offline ordering.
+    let h = (value ^ salt) >>> 0;
+    h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
+    h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
+    return (h ^ (h >>> 16)) >>> 0;
+  }
+  function shuffledOrder(count) {
+    // Fisher-Yates: option positions change on every showing, so the place of
+    // the right answer can never be memorised.
+    const order = Array.from({ length: count }, (_, index) => index);
+    for (let i = order.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    return order;
+  }
+
+  /* ---------- Elo panel ---------- */
+  function renderElo(snapshot) {
+    const box = $('#elopanel');
+    if (!box || !snapshot || !snapshot.overall) return;
+    B.elo = snapshot;
+    try { localStorage.setItem('recall.elo', JSON.stringify(snapshot)); } catch (_) { /* quota */ }
+    const o = snapshot.overall;
+    const change = o.change_today;
+    const trend = change === null || change === undefined ? ''
+      : `<span class="elodelta ${change >= 0 ? 'up' : 'down'}">${change >= 0 ? '▲' : '▼'} ${Math.abs(change).toFixed(0)} today</span>`;
+    const warn = o.lost_to_decay >= 1
+      ? `<span class="elowarn">−${o.lost_to_decay.toFixed(0)} lost to idleness</span>`
+      : (o.drop_if_idle_tomorrow >= 1
+        ? `<span class="elohint">−${o.drop_if_idle_tomorrow.toFixed(0)} tomorrow if you skip</span>` : '');
+    const chips = (snapshot.domains || []).slice(0, 6).map(d =>
+      `<span class="elochip${d.lost_to_decay >= 5 ? ' stale' : ''}" title="${esc(d.games)} answers · idle ${esc(d.idle_days)} d">`
+      + `${esc(d.key.split('/').pop())} <b>${Math.round(d.rating)}</b>`
+      + (d.lost_to_decay >= 1 ? ` <i>−${d.lost_to_decay.toFixed(0)}</i>` : '') + '</span>').join('');
+    box.innerHTML = `<div class="elomain"><span class="elolabel">Elo</span>`
+      + `<strong>${Math.round(o.rating)}</strong>${trend}${warn}</div>`
+      + (chips ? `<div class="elochips">${chips}</div>` : '');
+  }
+  async function refreshElo() {
+    try {
+      renderElo(await request('/api/elo', undefined, 'GET'));
+    } catch (_) {
+      try { renderElo(JSON.parse(localStorage.getItem('recall.elo') || 'null')); } catch (__) { /* none cached */ }
+    }
+  }
+  async function reconcile() {
+    // Drop questions another device already answered; let due ones come back.
+    try {
+      const state = await request('/api/sync/state', undefined, 'GET');
+      const recycled = new Set(state.recycled_ids || []);
+      const gone = (state.answered_ids || []).filter(id => !recycled.has(id))
+        .concat(state.postponed_ids || []);
+      if (gone.length) await idbDelete('deck', gone).catch(() => {});
+      if (recycled.size) {
+        const local = ((await recall('answered', [])) || []).filter(id => !recycled.has(id));
+        await remember('answered', local);
+      }
+      renderElo(state.elo);
+      return state;
+    } catch (_) { return null; }
+  }
+
   /* ---------- queue ---------- */
   function offlineInterleave(items, limit) {
     const buckets = {};
@@ -222,7 +300,8 @@ const bank = (() => {
     const ordered = deck
       .filter(item => !answered.has(item.id))
       .filter(item => B.mode !== 'travel' || !item.requires_scratchpad)
-      .sort((a, b) => (a.difficulty_tier - b.difficulty_tier) || (a.id - b.id));
+      .sort((a, b) => (a.difficulty_tier - b.difficulty_tier)
+        || (mix(a.id, daySalt()) - mix(b.id, daySalt())) || (a.id - b.id));
     return offlineInterleave(ordered, limit);
   }
 
@@ -235,11 +314,16 @@ const bank = (() => {
       const payload = await request(`/api/quiz/queue?limit=25&mode=${B.mode}&session_id=${encodeURIComponent(B.session)}`, undefined, 'GET');
       questions = Array.isArray(payload.questions) ? payload.questions : [];
       B.offline = false;
+      await flushReviews();
+      await reconcile();
       const answerSet = await recall('answered', []);
       const done = new Set(Array.isArray(answerSet) ? answerSet : []);
+      const pending = new Set((await idbRead('reviews').catch(() => [])).map(r => r.quiz_id));
       // A locally answered question may still be STAGED on the host until the
-      // queued review is flushed, so filter it out of the served queue.
-      questions = questions.filter(item => !done.has(item.id));
+      // queued review is flushed, so filter it out of the served queue.  A
+      // question the host says is due again (recycled) is allowed back.
+      questions = questions.filter(item => !pending.has(item.id)
+        && (item.recycled || !done.has(item.id)));
       if (questions.length) {
         await idbWrite('deck', questions.map(slim));
       }
@@ -264,7 +348,8 @@ const bank = (() => {
       cognitive_type: item.cognitive_type, requires_scratchpad: item.requires_scratchpad,
       difficulty_tier: item.difficulty_tier, question_md: item.question_md,
       options: Array.isArray(item.options) ? item.options : JSON.parse(item.options_json || '[]'),
-      correct_index: item.correct_index, explanation_md: item.explanation_md
+      correct_index: item.correct_index, explanation_md: item.explanation_md,
+      recycled: item.recycled ? 1 : 0
     };
   }
 
@@ -320,6 +405,10 @@ const bank = (() => {
     meta.appendChild(badge(TYPE_LABEL[item.cognitive_type] || item.cognitive_type, 'type-' + item.cognitive_type));
     meta.appendChild(badge('Tier ' + item.difficulty_tier, 'tierchip'));
     if (item.reinforcement) meta.appendChild(badge('🔁 Reinforcement', 'reinforcechip'));
+    if (item.recycled) meta.appendChild(badge('↻ Due again', 'reinforcechip'));
+    if (typeof item.predicted_success === 'number') {
+      meta.appendChild(badge(`${Math.round(item.predicted_success * 100)}% odds`, 'tierchip'));
+    }
     meta.appendChild(badge(item.requires_scratchpad ? '✎ paper' : '🧠 mental',
       item.requires_scratchpad ? 'paperchip' : 'mentalchip'));
     meta.appendChild(badge(`${B.pos + 1}/${B.queue.length}`, 'counter'));
@@ -334,12 +423,15 @@ const bank = (() => {
     options.className = 'optlist';
     const choices = Array.isArray(item.options) ? item.options
       : (() => { try { return JSON.parse(item.options_json || '[]'); } catch (_) { return []; } })();
-    choices.forEach((text, index) => {
+    // Display order is shuffled; ``data-index`` and choose() keep the stored
+    // index, so grading and the uploaded review are unaffected.
+    B.order = shuffledOrder(choices.length);
+    B.order.forEach((index, slot) => {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'opt';
       button.dataset.index = String(index);
-      button.innerHTML = `<span class="optkey">${'ABCD'[index]}</span><span class="opttext rich">${rich(text)}</span>`;
+      button.innerHTML = `<span class="optkey">${'ABCD'[slot]}</span><span class="opttext rich">${rich(choices[index])}</span>`;
       button.addEventListener('click', () => choose(index));
       options.appendChild(button);
     });
@@ -378,7 +470,8 @@ const bank = (() => {
     const item = B.current;
     const root = $('#bankcard');
     const buttons = [...root.querySelectorAll('.opt')];
-    buttons.forEach((button, position) => {
+    buttons.forEach(button => {
+      const position = Number(button.dataset.index);
       button.disabled = true;
       if (position === item.correct_index) button.classList.add('good');
       if (position === index && index !== item.correct_index) button.classList.add('badd');
@@ -388,7 +481,7 @@ const bank = (() => {
 
     const explanation = document.createElement('div');
     explanation.className = 'explain ' + (correct ? 'ok' : 'no');
-    explanation.innerHTML = `<div class="verdict">${correct ? '✓ Correct' : '✗ Not quite — correct answer is ' + 'ABCD'[item.correct_index]}</div>`
+    explanation.innerHTML = `<div class="verdict">${correct ? '✓ Correct' : '✗ Not quite — correct answer is ' + 'ABCD'[Math.max(0, B.order.indexOf(item.correct_index))]}</div>`
       + `<div class="rich">${rich(item.explanation_md || '')}</div>`;
     root.appendChild(explanation);
 
@@ -431,7 +524,7 @@ const bank = (() => {
       user_selection: selection,
       time_spent_seconds: Math.max(0, Math.round((Date.now() - B.askedAt) / 1000)),
       flow_rating: flowRating,
-      fsrs_grade: GRADE[flowRating],
+      fsrs_grade: gradeFor(flowRating, correct),
       context_mode: B.mode === 'travel' ? 'COMMUTE_TRAVEL' : 'DESK_STANDARD',
       error_category: selection === item.correct_index ? 'NONE' : null,
       client_id: B.session + '-' + item.id + '-' + Date.now(),
@@ -439,12 +532,14 @@ const bank = (() => {
     };
     await localComplete(item.id);
     let session = null;
+    let rating = null;
     let delivered = false;
     if (!B.offline) {
       try {
         const response = await request('/api/sync/push_reviews', { reviews: [review], session_id: B.session });
-        delivered = (response.accepted || 0) > 0;
+        delivered = (response.accepted || 0) > 0 || (response.duplicates || 0) > 0;
         session = response.session || null;
+        rating = response.elo || null;
       } catch (error) {
         delivered = false;
       }
@@ -455,9 +550,13 @@ const bank = (() => {
     }
     const note = document.createElement('div');
     note.className = 'srsnote';
+    const grade = gradeFor(flowRating, correct);
+    const moved = rating && typeof rating.overall_delta === 'number'
+      ? ` · Elo ${rating.overall_delta >= 0 ? '+' : ''}${rating.overall_delta.toFixed(1)} → ${Math.round(rating.overall)}` : '';
     note.textContent = delivered
-      ? `FSRS grade ${GRADE[flowRating]} applied · ${session ? session.directive : 'momentum updated'}`
-      : `Queued offline · FSRS grade ${GRADE[flowRating]}`;
+      ? `FSRS grade ${grade} applied · ${session ? session.directive : 'momentum updated'}${moved}`
+      : `Queued offline · FSRS grade ${grade}`;
+    if (delivered) refreshElo();
     const selector = root.querySelector('.flowwrap');
     if (selector) selector.appendChild(note);
     await scheduleReinforcement(item, correct, flowRating);
@@ -629,6 +728,28 @@ const bank = (() => {
       secure.className = 'networknote';
       secure.textContent = info.secure_context_note || '';
       box.appendChild(secure);
+      if (info.pairing_code) {
+        // Only the laptop itself is told the code; a phone needs it once.
+        const pair = document.createElement('div');
+        pair.className = 'networknote';
+        pair.textContent = 'Pairing code for a new phone/tablet: ';
+        const code = document.createElement('code');
+        code.textContent = info.pairing_code;
+        pair.appendChild(code);
+        box.appendChild(pair);
+        const link = (info.pair_urls || [])[0];
+        if (link) {
+          const copyPair = document.createElement('button');
+          copyPair.type = 'button';
+          copyPair.className = 'ghost small';
+          copyPair.textContent = 'Copy pairing link';
+          copyPair.addEventListener('click', async () => {
+            try { await navigator.clipboard.writeText(link); toast('Pairing link copied'); }
+            catch (_) { toast(link); }
+          });
+          box.appendChild(copyPair);
+        }
+      }
     } catch (error) {
       const offline = document.createElement('div');
       offline.className = 'networknote';
@@ -757,7 +878,12 @@ const bank = (() => {
       try {
         const response = await request('/api/sync/push_reviews', { reviews: slice, session_id: B.session });
         accepted += response.accepted || 0;
-        delivered.push(...slice.map(review => review.client_id));
+        // Only drop what the host has settled; a "retry" stays queued.
+        const settled = Array.isArray(response.results)
+          ? new Set(response.results.filter(r => r.status !== 'retry').map(r => r.client_id))
+          : null;
+        delivered.push(...slice.map(review => review.client_id)
+          .filter(id => !settled || settled.has(id)));
       } catch (error) {
         break;
       }
@@ -789,7 +915,10 @@ const bank = (() => {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.key === 'Escape') { closeSync(); return; }
       if (!B.current) return;
-      if (!B.answered && /^[1-4]$/.test(event.key)) { choose(Number(event.key) - 1); }
+      if (!B.answered && /^[1-4]$/.test(event.key)) {
+        const picked = B.order[Number(event.key) - 1];
+        if (picked !== undefined) choose(picked);
+      }
       else if (!B.answered && event.key.toLowerCase() === 'p') { postponeCurrent(); }
     });
     window.addEventListener('online', async () => {
@@ -800,6 +929,21 @@ const bank = (() => {
       loadQueue();
     });
     window.addEventListener('offline', () => { B.offline = true; notice('Offline — serving the cached deck.'); });
+    // navigator.onLine stays true on a LAN without the laptop, so "online"
+    // never fires when the host comes back: retry on a timer and on focus.
+    const retry = async () => {
+      const queued = await idbRead('reviews').catch(() => []);
+      if (!queued.length) return;
+      const result = await flushReviews();
+      if (result.accepted) {
+        B.offline = false;
+        toast(`Uploaded ${result.accepted} offline review(s)`);
+        refreshStats();
+        refreshElo();
+      }
+    };
+    setInterval(retry, 60000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) retry(); });
     syncTravelButton();
   }
 
@@ -813,6 +957,7 @@ const bank = (() => {
     bind();
     registerWorker();
     flushReviews().then(() => refreshStats());
+    refreshElo();
     if ($('#p-bank') && $('#p-bank').classList.contains('on')) activate();
     if (new URLSearchParams(location.search).get('sync') === '1') openSync();
     syncTravelButton();

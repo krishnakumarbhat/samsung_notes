@@ -42,6 +42,20 @@ def grade_for_flow(flow_rating: int) -> int:
         raise ValueError("flow_rating must be an integer between 1 and 5") from None
 
 
+def grade_for_review(flow_rating: int, correct: bool) -> int:
+    """FSRS grade for an answered question.
+
+    The flow rating says how the question *felt*; it must not override the
+    outcome.  A wrong answer is always ``Again`` (1) so that "wrong but it felt
+    easy" can never lengthen the interval, and a correct answer that left the
+    learner overwhelmed is ``Hard`` (2), never a lapse.
+    """
+    grade = grade_for_flow(flow_rating)
+    if not correct:
+        return 1
+    return max(2, grade)
+
+
 def _load_card(connection: sqlite3.Connection, topic: str) -> tuple[Card, str, int | None]:
     row = connection.execute(
         "SELECT card_json,folder,last_rating FROM fsrs_cards WHERE topic=?", (topic,)

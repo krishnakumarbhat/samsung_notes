@@ -5,11 +5,11 @@ import json
 import threading
 from typing import Literal
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from . import flow_scheduler, games, interleaving, network, quiz_factory, sync_bridge
+from . import auth, elo, flow_scheduler, games, interleaving, network, quiz_factory, sync_bridge
 from . import background_question_factory as background_factory
 
 router = APIRouter()
@@ -89,9 +89,32 @@ def quiz_stats() -> dict:
 @router.get("/api/quiz/queue")
 def quiz_queue(limit: int = Query(default=25, ge=1, le=200),
                mode: Literal["all", "travel"] = "all",
-               session_id: str = "default") -> dict:
-    """Interleaved queue for the current session and context mode."""
-    return flow_scheduler.build_queue(limit=limit, mode=mode, session_id=session_id)
+               session_id: str = "default",
+               shuffle: bool = True,
+               recycle: bool = True,
+               seed: int | None = Query(default=None, ge=0, le=2**32 - 1)) -> dict:
+    """Interleaved queue for the current session and context mode.
+
+    The order is an Elo-matched seeded sample by default; ``shuffle=0`` returns
+    the plain urgency order and ``seed`` reproduces a specific sequence.
+    """
+    chosen = seed
+    if shuffle and chosen is None:
+        chosen = flow_scheduler.daily_seed(session_id)
+    return flow_scheduler.build_queue(limit=limit, mode=mode, session_id=session_id,
+                                      seed=chosen if shuffle else None, recycle=recycle)
+
+
+@router.get("/api/elo")
+def elo_snapshot() -> dict:
+    """Learner ratings with decay already applied, per domain and overall."""
+    return elo.snapshot()
+
+
+@router.get("/api/sync/state")
+def sync_state() -> dict:
+    """Answered/postponed ids and ratings so a device can reconcile its cache."""
+    return sync_bridge.state()
 
 
 @router.get("/api/sync/pull_deck")
@@ -124,9 +147,19 @@ def pull_batch(count: int = Query(default=100, ge=1, le=300),
 
 
 @router.get("/api/network/info")
-def network_info() -> dict:
-    """LAN URLs, mDNS state and the install note shown in the sync modal."""
-    return network.network_info()
+def network_info(request: Request) -> dict:
+    """LAN URLs, mDNS state and the install note shown in the sync modal.
+
+    The pairing code is only disclosed to the laptop itself (loopback); a
+    paired phone sees the URLs but can never read the code back.
+    """
+    info = network.network_info()
+    info["auth_required"] = auth.enabled()
+    if auth.enabled() and auth.trusted(request.scope):
+        code = auth.token()
+        info["pairing_code"] = code
+        info["pair_urls"] = [f"{url}/pair?token={code}" for url in info["urls"]]
+    return info
 
 
 @router.post("/api/sync/push_reviews")

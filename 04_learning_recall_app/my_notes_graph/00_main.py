@@ -101,6 +101,8 @@ app = FastAPI(
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 from src.learning_routes import router as learning_router
 from engine.routes import router as flow_router
+from engine import auth as lan_auth
+from starlette.responses import RedirectResponse as StarletteRedirect
 app.include_router(learning_router)
 app.include_router(flow_router)
 
@@ -140,12 +142,72 @@ class LanHostGuard:
                  if entry.strip()}
         if hostname in extra:
             return True
+        # Tailscale: MagicDNS names and the 100.64.0.0/10 carrier-grade NAT
+        # range it assigns, which ``is_private`` does not cover.
+        if hostname.endswith(".ts.net"):
+            return True
         try:
-            return ipaddress.ip_address(hostname).is_private
+            address = ipaddress.ip_address(hostname)
         except ValueError:
             return False
+        return address.is_private or address in _TAILNET
 
 
+_TAILNET = ipaddress.ip_network("100.64.0.0/10")
+
+
+class LanTokenGuard:
+    """Require the pairing token from every client that is not loopback.
+
+    See :mod:`engine.auth`.  ``/pair?token=...`` sets the cookie and redirects
+    to the dashboard; an unpaired browser gets a small pairing form, an
+    unpaired API call gets 401.
+    """
+
+    def __init__(self, application) -> None:
+        self.application = application
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not lan_auth.enabled():
+            await self.application(scope, receive, send)
+            return
+        peer = (scope.get("client") or ("", 0))[0]
+        path = scope.get("path", "")
+        if lan_auth.trusted(scope):
+            await self.application(scope, receive, send)
+            return
+        if path == "/pair":
+            if lan_auth.locked_out(peer):
+                response = HTMLResponse(lan_auth.pair_page(
+                    "Too many wrong codes. Wait five minutes."), status_code=429)
+            elif lan_auth.valid(lan_auth.query_token(scope)):
+                response = StarletteRedirect("/", status_code=303)
+                response.headers["Set-Cookie"] = lan_auth.cookie_header()
+                response.headers["Cache-Control"] = "no-store"
+                response.headers["Referrer-Policy"] = "no-referrer"
+            else:
+                if lan_auth.query_token(scope):
+                    lan_auth.note_failure(peer)
+                    response = HTMLResponse(lan_auth.pair_page("That code is not right."),
+                                            status_code=401)
+                else:
+                    response = HTMLResponse(lan_auth.pair_page())
+            await response(scope, receive, send)
+            return
+        if path in lan_auth.OPEN_PATHS or lan_auth.valid(lan_auth.presented(scope)):
+            await self.application(scope, receive, send)
+            return
+        if lan_auth.presented(scope):
+            lan_auth.note_failure(peer)
+        if path == "/" or not path.startswith(("/api/", "/static/")):
+            response = HTMLResponse(lan_auth.pair_page(), status_code=401)
+        else:
+            response = StarletteJSONResponse(
+                {"detail": "This device is not paired. Open /pair on it."}, status_code=401)
+        await response(scope, receive, send)
+
+
+app.add_middleware(LanTokenGuard)
 app.add_middleware(LanHostGuard)
 
 

@@ -11,7 +11,7 @@
  */
 'use strict';
 
-const VERSION = 'recall-v3';
+const VERSION = 'recall-v4';
 const SHELL_CACHE = `${VERSION}-shell`;
 const VENDOR_CACHE = `${VERSION}-vendor`;
 const API_CACHE = `${VERSION}-api`;
@@ -37,7 +37,7 @@ const VENDOR = [
   '/static/vendor/auto-render.min.js'
 ];
 
-const CACHEABLE_API = /^\/api\/(quiz\/(stats|queue)|sync\/(pull_deck|pull_batch|export_deck)|games\/(topics|scores|sudoku|match|trap_hunt))/;
+const CACHEABLE_API = /^\/api\/(elo|quiz\/(stats|queue)|sync\/(pull_deck|pull_batch|export_deck)|games\/(topics|scores|sudoku|match|trap_hunt))/;
 
 self.addEventListener('install', event => {
   event.waitUntil((async () => {
