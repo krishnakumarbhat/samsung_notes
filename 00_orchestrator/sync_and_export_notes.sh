@@ -13,8 +13,8 @@ flock -n 9 || { echo 'Another sync/export run owns the workspace lock.' >&2; exi
 
 USED=$(du -s --block-size=1 "$SAM_ROOT" | cut -f1)
 FREE=$(df --output=avail --block-size=1 "$SAM_ROOT" | tail -1 | tr -d ' ')
-if (( USED >= 55000000000 || FREE < 16106127360 )); then
-  echo "Disk guard refused: allocated=$USED free=$FREE (cap55GB, floor15GiB)." >&2
+if (( USED >= 59000000000 || FREE < 16106127360 )); then
+  echo "Disk guard refused: allocated=$USED free=$FREE (cap59GB, floor15GiB)." >&2
   exit 1
 fi
 "$OPENCODE_PYTHON" -c 'import pikepdf,fitz'

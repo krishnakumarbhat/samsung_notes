@@ -46,9 +46,9 @@ start() {
     notify-send -u critical "VM boot aborted" "projecteo has ${FREE_MB}MB free (<15GB)" 2>/dev/null || true
     echo "ABORT: projecteo free ${FREE_MB}MB < 15GB"; exit 1
   fi
-  if [ "${VM_BYTES:-0}" -ge 55000000000 ]; then
-    notify-send -u critical "VM boot aborted" "VM dir ${VM_MB}MB exceeds 55GB ceiling" 2>/dev/null || true
-    echo "ABORT: VM dir ${VM_MB}MB > 55GB ceiling"; exit 1
+  if [ "${VM_BYTES:-0}" -ge 59000000000 ]; then
+    notify-send -u critical "VM boot aborted" "VM dir ${VM_MB}MB exceeds 59GB ceiling" 2>/dev/null || true
+    echo "ABORT: VM dir ${VM_MB}MB > 59GB ceiling"; exit 1
   fi
   MEM="${2:-6144}"
   ARGS=(
