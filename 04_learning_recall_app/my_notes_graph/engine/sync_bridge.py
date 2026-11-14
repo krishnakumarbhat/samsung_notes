@@ -171,7 +171,8 @@ def push_reviews(reviews: list[dict], *, path: str | None = None,
                                 "status": "rejected"})
                 continue
             question = connection.execute(
-                """SELECT id,concept_id,topic_folder,correct_index,status,difficulty_tier
+                """SELECT id,concept_id,topic_folder,correct_index,status,difficulty_tier,
+                          cognitive_type,requires_scratchpad
                    FROM quiz_bank WHERE id=?""", (review["quiz_id"],)).fetchone()
             if not question:
                 errors.append(f"review {index}: unknown quiz_id {review['quiz_id']}")
@@ -222,7 +223,10 @@ def push_reviews(reviews: list[dict], *, path: str | None = None,
                     connection, quiz_id=review["quiz_id"],
                     topic_folder=str(question["topic_folder"] or ""),
                     difficulty_tier=int(question["difficulty_tier"]),
-                    correct=bool(correct), when=review["reviewed_at"])
+                    correct=bool(correct), when=review["reviewed_at"],
+                    time_spent_seconds=review["time_spent_seconds"],
+                    cognitive_type=str(question["cognitive_type"]),
+                    requires_scratchpad=bool(question["requires_scratchpad"]))
                 connection.commit()
             except Exception:
                 # Ratings are derived data; never lose an accepted review for them.

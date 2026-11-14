@@ -286,10 +286,11 @@ def interleave(items: list[dict], limit: int) -> list[dict]:
 
 def apply_travel_postponement(path: str | None = None, *, hours: float = TRAVEL_POSTPONE_HOURS,
                               now: datetime | None = None) -> int:
-    """Postpone every due paper-calculation question and its card by ``hours``.
+    """Postpone every due paper-calculation question by ``hours``.
 
-    No FSRS lapse is recorded: the card keeps its stability and difficulty, only
-    the due time moves.  Returns the number of questions postponed.
+    No FSRS lapse is recorded: a card keeps its stability and difficulty. Its due
+    time moves (once) only if the concept has no desk-free question to serve.
+    Returns the number of questions postponed.
     """
     moment = now or datetime.now(timezone.utc)
     stamp = moment.timestamp()
@@ -308,10 +309,22 @@ def apply_travel_postponement(path: str | None = None, *, hours: float = TRAVEL_
                 (stamp + hours * 3600.0, row["id"]),
             )
         connection.commit()
+        # The concept's card moves only when travel mode has nothing left to ask
+        # about it, and only once however many paper questions it has (it used
+        # to move 24 h per question).
+        concepts = []
+        for concept in dict.fromkeys(str(row["concept_id"]) for row in rows):
+            desk_free = connection.execute(
+                """SELECT 1 FROM quiz_bank WHERE concept_id=? AND requires_scratchpad=0
+                   AND status IN ('STAGED','SYNCED_TO_MOBILE','ANSWERED')
+                   AND (postponed_until IS NULL OR postponed_until<=?) LIMIT 1""",
+                (concept, stamp)).fetchone()
+            if not desk_free:
+                concepts.append(concept)
     finally:
         connection.close()
-    for row in rows:
-        fsrs_bridge.postpone(row["concept_id"], hours, path=path, now=moment)
+    for concept in concepts:
+        fsrs_bridge.postpone(concept, hours, path=path, now=moment)
     return len(rows)
 
 
@@ -387,6 +400,9 @@ def stats(path: str | None = None) -> dict:
             "reviews_logged": reviews,
             "reviews_today": reviewed_today,
             "travel_ready": travel_free,
+            "leeches": int(connection.execute("SELECT COUNT(*) FROM concept_leech").fetchone()[0]),
+            "leeches_needing_simpler_card": int(connection.execute(
+                "SELECT COUNT(*) FROM concept_leech WHERE needs_simplified=1").fetchone()[0]),
             "by_type": by_type,
         }
     finally:

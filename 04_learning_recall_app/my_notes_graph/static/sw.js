@@ -11,7 +11,7 @@
  */
 'use strict';
 
-const VERSION = 'recall-v4';
+const VERSION = 'recall-v5';
 const SHELL_CACHE = `${VERSION}-shell`;
 const VENDOR_CACHE = `${VERSION}-vendor`;
 const API_CACHE = `${VERSION}-api`;

@@ -409,3 +409,25 @@ body.travel-mode .tagline::after{content:" · travel mode";color:var(--green)}
   .games-toolbar{margin-bottom:8px}
   .gamestagehead{margin-bottom:8px}
 }
+
+/* ---- Bank polish (2026-11-14): phone layout, tap targets, transitions ---- */
+.bankcard.answered .bankactions{display:none}
+@media(prefers-reduced-motion:no-preference){
+ .bankcard{animation:fadein .18s ease}
+ .explain,.flowwrap,.srsnote,.nextq{animation:fadein .2s ease}
+ .bankcard .opt,.flowbtn,.ctxbtn{transition:background-color .15s ease,border-color .15s ease,transform .08s ease}
+ .bankcard .opt:active:not(:disabled),.flowbtn:active:not(:disabled){transform:scale(.985)}
+}
+@media(max-width:760px){
+ .flow-row .flowbtn:last-child:nth-child(odd){grid-column:1/-1}
+ .flowbtn{flex-direction:row;justify-content:center;gap:8px;padding:11px 8px;font-size:13px;min-height:44px}
+ .bankcard{padding-left:14px;padding-right:14px}
+ .bankcard .opt{min-height:44px}
+}
+@media(max-width:650px){
+ header .ctxbtn,header .mobile-source-toggle,.duepill button{min-height:40px}
+ .brand{flex:0 0 auto}
+ .duepill #duetxt{display:none}
+ .duepill{padding:3px;max-width:none}
+ .ctxcontrols{gap:6px}
+}

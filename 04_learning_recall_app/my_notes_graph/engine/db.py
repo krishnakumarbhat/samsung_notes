@@ -110,6 +110,15 @@ CREATE INDEX IF NOT EXISTS session_weakness_session_idx
 CREATE INDEX IF NOT EXISTS session_weakness_variant_idx
     ON session_weakness(variant_quiz_id);
 
+-- Leech guard: a concept that keeps lapsing. ``needs_simplified`` asks the question
+-- factory for an easier intuition card when the bank has none to fall back on.
+CREATE TABLE IF NOT EXISTS concept_leech(
+    concept_id TEXT PRIMARY KEY,
+    lapses INTEGER NOT NULL DEFAULT 0,
+    needs_simplified INTEGER NOT NULL DEFAULT 0,
+    flagged_at TEXT NOT NULL
+);
+
 -- Elo ratings: scope 'learner' (key '*' = overall, else a study domain) and
 -- scope 'question' (key = quiz id).  Learner decay is computed on read from
 -- ``last_active``, so no nightly job is needed and sync replays are safe.

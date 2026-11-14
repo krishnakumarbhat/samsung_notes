@@ -168,12 +168,100 @@ def _pick_variant(connection, source, *, exclude: int) -> object | None:
     ))
 
 
-def register_weakness(session_id: str, quiz_id: int, *, position: int = 0,
-                      path: str | None = None, rng: random.Random | None = None) -> dict:
-    """Schedule one same-concept variant 8-12 slots after the failed question.
+SESSION_WINDOW_HOURS = 6.0
+PREREQUISITE_AFTER_FAILS = 2
+LEECH_AFTER_LAPSES = 4
+REMEDIATION_GAP = 2          # a prerequisite or intuition card comes back almost at once
 
-    Repeating a failure for the same concept in one session reuses the already
-    scheduled variant instead of flooding the queue with duplicates.
+
+def _failures(connection, concept_id: str, session_id: str, this_is_a_failure: bool) -> tuple[int, int]:
+    """(failures of the concept in this session, lifetime lapses).
+
+    The session is the last few hours of logged wrong answers.  The review for
+    the current miss may still be in the device's upload queue, so the
+    session's own weakness rows are counted too and the larger number wins.
+    """
+    cutoff = datetime.fromtimestamp(time.time() - SESSION_WINDOW_HOURS * 3600.0, timezone.utc).isoformat()
+    logged_recent = int(connection.execute(
+        """SELECT COUNT(*) FROM flow_review_logs l JOIN quiz_bank q ON q.id=l.quiz_id
+           WHERE q.concept_id=? AND l.is_correct=0 AND l.reviewed_at>=?""",
+        (concept_id, cutoff)).fetchone()[0])
+    lifetime = int(connection.execute(
+        """SELECT COUNT(*) FROM flow_review_logs l JOIN quiz_bank q ON q.id=l.quiz_id
+           WHERE q.concept_id=? AND l.is_correct=0""", (concept_id,)).fetchone()[0])
+    scheduled = int(connection.execute(
+        """SELECT COUNT(*) FROM session_weakness
+           WHERE session_id=? AND concept_id=? AND created_at>=?""",
+        (session_id, concept_id, cutoff)).fetchone()[0])
+    extra = 1 if this_is_a_failure else 0
+    in_session = max(logged_recent, scheduled + extra)
+    return in_session, max(lifetime, in_session)
+
+
+def _pick_prerequisite(connection, source, *, exclude: int):
+    """The concept the notes introduce just before this one.
+
+    Notes are written in teaching order, so the nearest earlier page of the same
+    source that holds a different concept is the working definition of a
+    prerequisite.  With no earlier page, the easiest other concept in the same
+    folder stands in.  Answered questions are allowed: revisiting one is the
+    point.
+    """
+    rows = connection.execute(
+        """SELECT * FROM quiz_bank
+           WHERE source_pdf=? AND source_pdf<>'' AND page_num<? AND concept_id<>? AND id<>?
+             AND status<>'POSTPONED'""",
+        (source["source_pdf"], int(source["page_num"]), source["concept_id"], exclude)).fetchall()
+    if rows:
+        return min(rows, key=lambda row: (
+            int(source["page_num"]) - int(row["page_num"]),
+            TYPE_PREFERENCE.get(str(row["cognitive_type"]), 9),
+            int(row["difficulty_tier"]), int(row["id"])))
+    rows = connection.execute(
+        """SELECT * FROM quiz_bank
+           WHERE topic_folder=? AND concept_id<>? AND id<>? AND difficulty_tier<? AND status<>'POSTPONED'""",
+        (source["topic_folder"], source["concept_id"], exclude, int(source["difficulty_tier"]))).fetchall()
+    if not rows:
+        return None
+    return min(rows, key=lambda row: (
+        int(row["difficulty_tier"]), TYPE_PREFERENCE.get(str(row["cognitive_type"]), 9), int(row["id"])))
+
+
+def _pick_intuition(connection, source, *, exclude: int):
+    """The simplest intuition card of the same concept (answered ones included)."""
+    rows = connection.execute(
+        """SELECT * FROM quiz_bank
+           WHERE concept_id=? AND id<>? AND cognitive_type='INTUITION' AND status<>'POSTPONED'""",
+        (source["concept_id"], exclude)).fetchall()
+    if not rows:
+        return None
+    return min(rows, key=lambda row: (int(row["difficulty_tier"]), int(row["id"])))
+
+
+def leeches(path: str | None = None) -> list[dict]:
+    """Concepts flagged by the leech guard, worst first."""
+    connection = db.open_database(path)
+    try:
+        return [dict(row) for row in connection.execute(
+            "SELECT concept_id,lapses,needs_simplified,flagged_at FROM concept_leech ORDER BY lapses DESC")]
+    finally:
+        connection.close()
+
+
+def register_weakness(session_id: str, quiz_id: int, *, position: int = 0,
+                      path: str | None = None, rng: random.Random | None = None,
+                      correct: bool | None = None) -> dict:
+    """Schedule what should come back after a missed (or effortful) question.
+
+    Ladder, strongest first:
+      * 4 lifetime lapses of the concept: the leech guard serves the simplest
+        intuition card and flags the concept (asking the factory for a simpler
+        card when the bank has none);
+      * 2 failures in this session: the prerequisite concept, two slots later;
+      * otherwise one same-concept variant 8-12 slots later (unchanged).
+    ``correct=True`` (a right but effortful answer) never climbs the ladder.
+    Repeating a failure reuses an already scheduled card of the same kind
+    instead of flooding the queue.
     """
     moment = time.time()
     generator = rng or random.Random()
@@ -182,6 +270,42 @@ def register_weakness(session_id: str, quiz_id: int, *, position: int = 0,
         source = connection.execute("SELECT * FROM quiz_bank WHERE id=?", (int(quiz_id),)).fetchone()
         if not source:
             raise ValueError("unknown quiz id")
+        failed = correct is not True
+        in_session, lapses = _failures(connection, str(source["concept_id"]), session_id, failed)
+        remedy, kind = None, "variant"
+        if failed and lapses >= LEECH_AFTER_LAPSES:
+            remedy, kind = _pick_intuition(connection, source, exclude=int(quiz_id)), "intuition"
+            connection.execute(
+                """INSERT INTO concept_leech(concept_id,lapses,needs_simplified,flagged_at)
+                   VALUES(?,?,?,?)
+                   ON CONFLICT(concept_id) DO UPDATE SET lapses=excluded.lapses,
+                       needs_simplified=excluded.needs_simplified""",
+                (source["concept_id"], lapses, 0 if remedy else 1,
+                 datetime.now(timezone.utc).isoformat()))
+            connection.commit()
+        if failed and remedy is None and in_session >= PREREQUISITE_AFTER_FAILS:
+            remedy, kind = _pick_prerequisite(connection, source, exclude=int(quiz_id)), "prerequisite"
+        if remedy is not None:
+            already = connection.execute(
+                """SELECT id FROM session_weakness
+                   WHERE session_id=? AND variant_quiz_id=? AND resolved=0""",
+                (session_id, int(remedy["id"]))).fetchone()
+            if already:
+                weakness_id = int(already["id"])
+            else:
+                weakness_id = int(connection.execute(
+                    """INSERT INTO session_weakness
+                       (session_id,source_quiz_id,concept_id,variant_quiz_id,insert_after,
+                        position,resolved,priority,created_at)
+                       VALUES(?,?,?,?,?,?,0,1,?)""",
+                    (session_id, int(quiz_id), source["concept_id"], int(remedy["id"]),
+                     REMEDIATION_GAP, int(position),
+                     datetime.now(timezone.utc).isoformat())).lastrowid)
+                connection.commit()
+            return {"weakness_id": weakness_id, "insert_after": REMEDIATION_GAP,
+                    "question": _payload(remedy), "reused": bool(already), "priority": 1,
+                    "remediation": kind, "failures_in_session": in_session, "lapses": lapses}
+        kind = "variant"
         existing = connection.execute(
             """SELECT * FROM session_weakness
                WHERE session_id=? AND concept_id=? AND resolved=0
@@ -193,11 +317,13 @@ def register_weakness(session_id: str, quiz_id: int, *, position: int = 0,
                 "SELECT * FROM quiz_bank WHERE id=?", (int(existing["variant_quiz_id"]),)).fetchone()
             if variant:
                 return {"weakness_id": int(existing["id"]), "insert_after": int(existing["insert_after"]),
-                        "question": _payload(variant), "reused": True, "priority": int(existing["priority"])}
+                        "question": _payload(variant), "reused": True, "priority": int(existing["priority"]),
+                        "remediation": kind, "failures_in_session": in_session, "lapses": lapses}
         variant = _pick_variant(connection, source, exclude=int(quiz_id))
         if not variant:
             return {"weakness_id": None, "insert_after": 0, "question": None,
-                    "reused": False, "priority": 0}
+                    "reused": False, "priority": 0, "remediation": None,
+                    "failures_in_session": in_session, "lapses": lapses}
         gap = int(generator.randint(WEAKNESS_MIN_GAP, WEAKNESS_MAX_GAP))
         cursor = connection.execute(
             """INSERT INTO session_weakness
@@ -209,7 +335,8 @@ def register_weakness(session_id: str, quiz_id: int, *, position: int = 0,
         )
         connection.commit()
         return {"weakness_id": int(cursor.lastrowid), "insert_after": gap,
-                "question": _payload(variant), "reused": False, "priority": 0}
+                "question": _payload(variant), "reused": False, "priority": 0,
+                "remediation": kind, "failures_in_session": in_session, "lapses": lapses}
     finally:
         connection.close()
 

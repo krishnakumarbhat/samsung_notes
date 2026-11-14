@@ -391,6 +391,7 @@ const bank = (() => {
     const item = B.queue[B.pos % B.queue.length];
     B.current = item;
     B.answered = false;
+    B.rated = false;
     B.askedAt = Date.now();
 
     const root = document.createElement('article');
@@ -404,7 +405,9 @@ const bank = (() => {
     meta.appendChild(concept);
     meta.appendChild(badge(TYPE_LABEL[item.cognitive_type] || item.cognitive_type, 'type-' + item.cognitive_type));
     meta.appendChild(badge('Tier ' + item.difficulty_tier, 'tierchip'));
-    if (item.reinforcement) meta.appendChild(badge('🔁 Reinforcement', 'reinforcechip'));
+    if (item.remediation === 'prerequisite') meta.appendChild(badge('⬅ Prerequisite', 'reinforcechip'));
+    else if (item.remediation === 'intuition') meta.appendChild(badge('💡 Simpler card', 'reinforcechip'));
+    else if (item.reinforcement) meta.appendChild(badge('🔁 Reinforcement', 'reinforcechip'));
     if (item.recycled) meta.appendChild(badge('↻ Due again', 'reinforcechip'));
     if (typeof item.predicted_success === 'number') {
       meta.appendChild(badge(`${Math.round(item.predicted_success * 100)}% odds`, 'tierchip'));
@@ -453,7 +456,7 @@ const bank = (() => {
     actions.appendChild(skip);
     const hint = document.createElement('span');
     hint.className = 'bankhint';
-    hint.textContent = 'Keys: 1–4 answer · P postpone';
+    hint.textContent = 'Keys: 1–4 answer · P postpone · Space/Enter next';
     actions.appendChild(hint);
     root.appendChild(actions);
 
@@ -467,6 +470,9 @@ const bank = (() => {
   function choose(index) {
     if (!B.current || B.answered) return;
     B.answered = true;
+    B.selection = index;
+    const answeredCard = document.querySelector('#bankcard .bankcard');
+    if (answeredCard) answeredCard.classList.add('answered');
     const item = B.current;
     const root = $('#bankcard');
     const buttons = [...root.querySelectorAll('.opt')];
@@ -489,7 +495,7 @@ const bank = (() => {
     selector.className = 'flowwrap';
     const prompt = document.createElement('div');
     prompt.className = 'flowprompt';
-    prompt.textContent = 'How did that feel? Rate the challenge to set the next difficulty.';
+    prompt.textContent = 'How did that feel? Rate the challenge to set the next difficulty. Keys 1–5, or Space for Flow State.';
     selector.appendChild(prompt);
     const row = document.createElement('div');
     row.className = 'flow-row';
@@ -511,7 +517,9 @@ const bank = (() => {
 
   async function rate(flowRating, selection) {
     // Persist the grade instantly, even if the network is down.
-    if (!B.current) return;
+    if (!B.current || B.rated) return;
+    B.rated = true;
+    B.selection = selection;
     const item = B.current;
     const correct = selection === item.correct_index;
     const root = $('#bankcard');
@@ -551,8 +559,10 @@ const bank = (() => {
     const note = document.createElement('div');
     note.className = 'srsnote';
     const grade = gradeFor(flowRating, correct);
+    const pace = rating && rating.speed_factor > 1.01 ? ` (fast ×${rating.speed_factor.toFixed(2)})`
+      : rating && rating.speed_factor < 0.99 ? ` (slow ×${rating.speed_factor.toFixed(2)})` : '';
     const moved = rating && typeof rating.overall_delta === 'number'
-      ? ` · Elo ${rating.overall_delta >= 0 ? '+' : ''}${rating.overall_delta.toFixed(1)} → ${Math.round(rating.overall)}` : '';
+      ? ` · Elo ${rating.overall_delta >= 0 ? '+' : ''}${rating.overall_delta.toFixed(1)}${pace} → ${Math.round(rating.overall)}` : '';
     note.textContent = delivered
       ? `FSRS grade ${grade} applied · ${session ? session.directive : 'momentum updated'}${moved}`
       : `Queued offline · FSRS grade ${grade}`;
@@ -565,27 +575,38 @@ const bank = (() => {
     nextButton.className = 'pri nextq';
     nextButton.textContent = B.pos + 1 < B.queue.length ? 'Next question →' : 'Next batch →';
     nextButton.addEventListener('click', next);
+    nextButton.title = 'Space or Enter';
     if (selector) selector.appendChild(nextButton);
+    nextButton.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     refreshStats();
   }
 
   async function scheduleReinforcement(item, correct, flowRating) {
     // Missed or effortful questions return as a same-concept variant 8-12 slots
     // later.  A variant is itself a second pass, so it never re-schedules.
-    if (item.reinforcement || (correct && flowRating < 4)) return;
+    // A missed variant is a second failure in the session: the server then steps
+    // back to the prerequisite (or a simpler card for a leech).  Prerequisite and
+    // intuition cards themselves never re-schedule.
+    if (item.remediation === 'prerequisite' || item.remediation === 'intuition') return;
+    if (item.reinforcement && correct) return;
+    if (correct && flowRating < 4) return;
+    const secondPass = !!item.reinforcement;
     let question = null;
     let gap = 8 + Math.floor(Math.random() * 5);
     if (!B.offline) {
       try {
         const payload = await request('/api/quiz/weakness',
-          { quiz_id: item.id, session_id: B.session, position: B.pos }, 'POST');
+          { quiz_id: item.id, session_id: B.session, position: B.pos, correct: !!correct }, 'POST');
         question = payload && payload.question ? payload.question : null;
         if (payload && payload.insert_after) gap = payload.insert_after;
+        if (question && payload.remediation) question.remediation = payload.remediation;
+        // After a missed variant only a step back helps; another variant would loop.
+        if (secondPass && question && question.remediation === 'variant') question = null;
       } catch (error) {
         question = null;
       }
     }
-    if (!question) {
+    if (!question && !secondPass) {
       const deck = await idbRead('deck').catch(() => []);
       const queued = new Set(B.queue.map(entry => entry.id));
       question = (deck || []).find(entry => entry.id !== item.id
@@ -597,7 +618,13 @@ const bank = (() => {
     question.reinforcement = true;
     const at = Math.min(B.queue.length, B.pos + 1 + gap);
     B.queue.splice(at, 0, question);
-    toast(`Weak concept “${question.concept_id}” returns in ${gap} questions`);
+    if (question.remediation === 'prerequisite') {
+      toast(`Missed twice: stepping back to “${question.concept_id}” first`);
+    } else if (question.remediation === 'intuition') {
+      toast(`“${item.concept_id}” keeps slipping: a simpler card is next`);
+    } else {
+      toast(`Weak concept “${question.concept_id}” returns in ${gap} questions`);
+    }
   }
 
   async function localComplete(quizId) {    const answered = new Set((await recall('answered', [])) || []);
@@ -920,6 +947,18 @@ const bank = (() => {
         if (picked !== undefined) choose(picked);
       }
       else if (!B.answered && event.key.toLowerCase() === 'p') { postponeCurrent(); }
+      else if (B.answered && !B.rated && /^[1-5]$/.test(event.key)) {
+        event.preventDefault();
+        rate(Number(event.key), B.selection);
+      }
+      else if (B.answered && (event.key === ' ' || event.key === 'Enter')) {
+        // Space / Enter: accept "Flow State" if not rated yet, otherwise go on.
+        if (event.target.tagName === 'BUTTON' && !event.target.disabled && event.key === 'Enter') return;
+        event.preventDefault();
+        const nextButton = document.querySelector('#bankcard .nextq');
+        if (nextButton) nextButton.click();
+        else if (!B.rated) rate(3, B.selection);
+      }
     });
     window.addEventListener('online', async () => {
       B.offline = false;

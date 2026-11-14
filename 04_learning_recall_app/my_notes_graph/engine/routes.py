@@ -66,6 +66,7 @@ class WeaknessRequest(BaseModel):
     quiz_id: int = Field(ge=1)
     session_id: str = Field(default="default", max_length=80)
     position: int = Field(default=0, ge=0, le=1000)
+    correct: bool | None = None
 
 
 class GameScoreRequest(BaseModel):
@@ -187,10 +188,10 @@ def flow(body: FlowRequest) -> dict:
 
 @router.post("/api/quiz/weakness")
 def weakness(body: WeaknessRequest) -> dict:
-    """Schedule a same-concept variant 8-12 questions after a miss."""
+    """Schedule the variant, prerequisite or intuition card that follows a miss."""
     try:
         return interleaving.register_weakness(
-            body.session_id, body.quiz_id, position=body.position)
+            body.session_id, body.quiz_id, position=body.position, correct=body.correct)
     except ValueError as error:
         raise HTTPException(404, str(error)) from None
 

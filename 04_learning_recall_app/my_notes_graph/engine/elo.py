@@ -72,6 +72,33 @@ def question_k(games: int) -> float:
     return 8.0 + 24.0 / (1.0 + max(0, int(games)) / 5.0)
 
 
+# Typical unhurried answer time per question type, in seconds.  Used only as the
+# reference for the speed factor; paper questions get half as much again.
+REFERENCE_SECONDS = {"INTUITION": 20.0, "ADVERSARIAL_TRAP": 40.0,
+                     "SYSTEM_APPLICATION": 60.0, "CALCULATION_STEP": 75.0}
+SPEED_SPAN = 0.25
+
+
+def reference_seconds(cognitive_type: str = "", requires_scratchpad: bool = False) -> float:
+    base = REFERENCE_SECONDS.get(str(cognitive_type), 45.0)
+    return base * (1.5 if requires_scratchpad else 1.0)
+
+
+def speed_factor(correct: bool, time_spent_seconds: float, reference: float) -> float:
+    """K multiplier for the learner's rating from how long a CORRECT answer took.
+
+    Answering in half the reference time or less earns 1.25x, the reference time
+    1.0x, twice the reference or more 0.75x (log scale in between).  A wrong
+    answer and an unknown time (0, e.g. an old client) are never scaled: speed
+    is evidence of fluency only when the answer was right, and a fast wrong
+    answer is already penalised by the outcome.
+    """
+    if not correct or time_spent_seconds <= 0 or reference <= 0:
+        return 1.0
+    octaves = math.log2(max(1.0, float(time_spent_seconds)) / float(reference))
+    return 1.0 - SPEED_SPAN * min(1.0, max(-1.0, octaves))
+
+
 def tier_rating(tier: int) -> float:
     """Prior difficulty rating of a question nobody has answered yet."""
     return TIER_RATING.get(int(tier), BASE)
@@ -129,17 +156,24 @@ def _store(connection: sqlite3.Connection, scope: str, key: str, rating: float,
 
 
 def record(connection: sqlite3.Connection, *, quiz_id: int, topic_folder: str,
-           difficulty_tier: int, correct: bool, when: datetime) -> dict:
+           difficulty_tier: int, correct: bool, when: datetime,
+           time_spent_seconds: float = 0.0, cognitive_type: str = "",
+           requires_scratchpad: bool = False) -> dict:
     """Apply one answered question to the overall, domain and question ratings.
 
     The caller owns the transaction.  ``when`` is the device's review time; a
     late-arriving offline review never moves ``last_active`` backwards.
+    A fast correct answer moves the learner's ratings more than a slow correct
+    one (see ``speed_factor``); the question's own rating is not time-scaled.
     """
+    speed = speed_factor(bool(correct), time_spent_seconds,
+                         reference_seconds(cognitive_type, requires_scratchpad))
     moment = when.timestamp()
     outcome = 1.0 if correct else 0.0
     domain = interleaving.domain_of(topic_folder)
     q_rating, q_games = question_rating(connection, quiz_id, difficulty_tier)
-    result: dict = {"domain": domain, "question_before": round(q_rating, 1)}
+    result: dict = {"domain": domain, "question_before": round(q_rating, 1),
+                    "speed_factor": round(speed, 3)}
     question_delta = 0.0
     for key in (OVERALL, domain):
         row = _row(connection, "learner", key)
@@ -150,7 +184,7 @@ def record(connection: sqlite3.Connection, *, quiz_id: int, topic_folder: str,
         else:
             last, before, games = moment, BASE, 0
         chance = expected(before, q_rating)
-        after = before + learner_k(games) * (outcome - chance)
+        after = before + learner_k(games) * speed * (outcome - chance)
         _store(connection, "learner", key, after, games + 1, max(last, moment))
         day = when.astimezone(timezone.utc).strftime("%Y-%m-%d")
         connection.execute(
