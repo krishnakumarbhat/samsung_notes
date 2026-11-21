@@ -9,29 +9,51 @@ VM_PORT=2222
 GUEST_HOME='C:/Users/notes'
 SCRIPTS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$SCRIPTS_DIR/../.." && pwd -P)"
-ENV_FILE="$PROJECT_ROOT/02_extracted_notes_pdf/.env"
+NATIVE_ENV_FILE="$HOME/.config/sam_win/.env"
+LEGACY_ENV_FILE="$PROJECT_ROOT/02_extracted_notes_pdf/.env"
 
-if [[ -z "${SAMSUNG_NOTES_PASSWORD:-}" && -f "$ENV_FILE" ]]; then
-  SAMSUNG_NOTES_PASSWORD=$(/usr/bin/python3 - "$ENV_FILE" <<'PY'
+read_guest_password() {
+  local env_file="$1"
+  [[ -f "$env_file" ]] || return 0
+  /usr/bin/python3 - "$env_file" <<'PY'
 from pathlib import Path
 import sys
 
 for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    if line.startswith("SAMSUNG_NOTES_PASSWORD="):
+    key, separator, value = line.partition("=")
+    if separator and key.strip() in {"SAMSUNG_NOTES_PASSWORD", "SAM_PASSWORD"} and value.strip().strip("\"'"):
         print(line.partition("=")[2].strip().strip("\"'"))
         break
 PY
-  )
+}
+
+if [[ -z "${SAMSUNG_NOTES_PASSWORD:-}" ]]; then
+  SAMSUNG_NOTES_PASSWORD="$(read_guest_password "$NATIVE_ENV_FILE")"
 fi
 if [[ -z "${SAMSUNG_NOTES_PASSWORD:-}" ]]; then
-  echo "Missing SAMSUNG_NOTES_PASSWORD in $ENV_FILE or environment." >&2
+  SAMSUNG_NOTES_PASSWORD="$(read_guest_password "$LEGACY_ENV_FILE")"
+fi
+if [[ -z "${SAMSUNG_NOTES_PASSWORD:-}" ]]; then
+  echo "Missing SAMSUNG_NOTES_PASSWORD in ~/.config/sam_win/.env, $LEGACY_ENV_FILE, or environment." >&2
   exit 2
 fi
 export SSHPASS="$SAMSUNG_NOTES_PASSWORD"
 unset SAMSUNG_NOTES_PASSWORD
 
+CONTROL_DIR="/tmp/opencode/sam_win_ssh"
+mkdir -p "$CONTROL_DIR"
+chmod 700 "$CONTROL_DIR" 2>/dev/null || true
+for control_socket in "$CONTROL_DIR"/*; do
+  [[ -S "$control_socket" ]] || continue
+  if ! ssh -O check -p "$VM_PORT" -o "ControlPath=$control_socket" \
+      "$VM_USER@$VM_HOST" >/dev/null 2>&1; then
+    rm -f -- "$control_socket"
+  fi
+done
 SSH_OPTIONS=(-o PubkeyAuthentication=no -o PreferredAuthentications=password
-  -o StrictHostKeyChecking=no -o ConnectTimeout=10)
+  -o StrictHostKeyChecking=no -o ConnectTimeout=10
+  -o ControlMaster=auto -o ControlPersist=120
+  -o "ControlPath=$CONTROL_DIR/%C")
 ssh_vm() {
   sshpass -e ssh -p "$VM_PORT" "${SSH_OPTIONS[@]}" "$VM_USER@$VM_HOST" "$@"
 }

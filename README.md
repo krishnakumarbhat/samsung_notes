@@ -101,8 +101,8 @@ directory.
 ## Data policy
 
 - **Never commit** `01_vm_windows_sync/vm/*.qcow2`, `02_extracted_notes_pdf/notes/**`,
-  `05_environments_and_venvs/models/**/*.safetensors`, `05_environments_and_venvs/python_ocr_env/**`
-  or any `.env` file.
+  `05_environments_and_venvs/models/**/*.safetensors`, the sibling
+  `../python_libs/` or `../python_libs_gpu/` package trees, or any `.env` file.
 - GitHub rejects individual files over 100 MB; this repository enforces a
   **99 MB** tracked-file ceiling and warns above 50 MB.
 - The note corpus is personal data. Keep transfer bundles on encrypted media and

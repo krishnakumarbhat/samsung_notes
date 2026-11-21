@@ -63,6 +63,8 @@ qmp.sock
 qemu.pid
 qemu.log
 *.log
+01_vm_windows_sync/vm/disk_monitor.pid
+.cache/samsung-notes-sync/
 untracked-own-repo
 
 # Semantic layout: generated note payloads and local OCR packages stay local.
@@ -75,7 +77,9 @@ untracked-own-repo
 02_extracted_notes_pdf/ai_agend_history/MISSION_COMPLETION_REPORT.json
 02_extracted_notes_pdf/ai_agend_history/sn-incremental-*/
 02_extracted_notes_pdf/ai_agend_history/repair_backups/
-05_environments_and_venvs/python_ocr_env/
+05_environments_and_venvs/python_ocr_env
+05_environments_and_venvs/models/paddleocr/
+temp/
 04_learning_recall_app/interview-taker-/
 04_learning_recall_app/notes_mirror/
 04_learning_recall_app/my_notes_graph/data/chroma/
@@ -94,6 +98,7 @@ untracked-own-repo
 
 # Private operational inventories and app state. Some pre-migration versions
 # were accidentally tracked; keep every local copy out of future commits.
+SESSION_CONTEXT.md
 00_orchestrator/*.json
 00_orchestrator/*.jsonl
 00_orchestrator/STAGE*_OPERATIONS.md

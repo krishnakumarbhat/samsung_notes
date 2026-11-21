@@ -10,11 +10,16 @@ render.  Nothing is guessed; every binding is proved before use:
   on missing, duplicate or unlisted page records).
 * A *single* embedded document binds directly: ``custom PDF page N`` is page
   ``N`` of that document, and the reference must be in range while the page
-  aspect cross-checks the CLI's reported height.
+  aspect cross-checks the CLI's reported height — in the source page's upright
+  MediaBox orientation or its quarter-turned presentation (pinned/rotated
+  paper), never by a free-form size guess.
 * *Multiple* embedded documents bind only through contiguous runs that reset
   numbering (``1..n``) and match document page counts uniquely.  Shared counts
   or unmatched runs fail closed with ``UnsupportedRecovery``; filename order
-  is never assumed.
+  is never assumed.  Runs that start partway through a document — because
+  pages were removed from the note — or that split at a numbering gap are
+  never bound by their length; they bind only when the page geometry proves
+  exactly one assignment, otherwise recovery stays fail-closed.
 * Every custom-PDF page is rendered once by the CLI and its content stream is
   proved to be exactly the deterministic page background (one full-page fill
   in the reported background colour, no other paint operator).  Ink, typed
@@ -35,7 +40,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 __all__ = ["recover", "UnsupportedRecovery"]
 
@@ -256,28 +261,51 @@ def _pdf_page_sizes(pdfs: Sequence[Path]) -> dict[str, list[tuple[float, float]]
     return sizes
 
 
+def _aspect_matches(box: tuple[float, float], page: dict) -> bool:
+    """Whether a visible page's reported size matches the source page geometry.
+
+    The note presents embedded paper either upright (its MediaBox orientation)
+    or turned a quarter turn, which is how a pinned/rotated page is stored, so
+    the reported height is checked against both orientations of the source
+    aspect with the tolerance of the upright check.  Anything else stays a
+    mismatch; the orientation that matches is a geometry proof of the same
+    source page, not a size guess.
+    """
+    width, height = float(page["width"]), float(page["height"])
+    tolerance = max(4.0, 0.003 * height)
+    return any(
+        abs(box_h * width / box_w - height) <= tolerance
+        for box_w, box_h in (box, (box[1], box[0]))
+    )
+
+
 def _check_height(name: str, number: int, box: tuple[float, float], page: dict) -> None:
     """Cross-check the CLI's reported page height against the embedded aspect.
 
     Observed scaled-height deviations stay below 2.2 note units; the tolerance
-    keeps rounding harmless while still rejecting a wrong binding.
+    keeps rounding harmless while still rejecting a wrong binding.  A page
+    whose geometry matches neither presentation of the referenced source page
+    fails closed and reports the upright scaled height.
     """
+    if _aspect_matches(box, page):
+        return
     scaled = box[1] * float(page["width"]) / box[0]
-    tolerance = max(4.0, 0.003 * page["height"])
-    if abs(scaled - page["height"]) > tolerance:
-        raise UnsupportedRecovery(
-            f"visible page {page['index']} height {page['height']} disagrees with "
-            f"{name} page {number} (scaled {scaled:.1f})",
-        )
+    raise UnsupportedRecovery(
+        f"visible page {page['index']} height {page['height']} disagrees with "
+        f"{name} page {number} (scaled {scaled:.1f})",
+    )
 
 
 def _runs(pages: Sequence[dict]) -> list[list[tuple[int, int]]]:
     """Split custom-PDF pages into contiguous runs with resetting numbering.
 
-    A run is a maximal contiguous visible sequence whose template numbers are
-    exactly ``1, 2, ..., n``; non-custom pages and numbering resets break a
-    run.  A run that neither continues nor restarts at 1 is rejected, so no
-    assignment can rest on a partial or repeating sequence.
+    A run is a maximal contiguous visible sequence whose template numbers
+    increase by one.  Non-custom pages break a run, and so does any numbering
+    gap or reset: the following page then starts a new run at its own number,
+    which may lie partway through a document because pages were removed from
+    the note.  Such partial runs are never bound by their length;
+    ``_bind_pdfs`` accepts them only through a unique page-geometry proof and
+    fails closed when that proof is missing or ambiguous.
     """
     runs: list[list[tuple[int, int]]] = []
     current: list[tuple[int, int]] = []
@@ -289,16 +317,12 @@ def _runs(pages: Sequence[dict]) -> list[list[tuple[int, int]]]:
                 current = []
             continue
         number = int(match.group(1))
-        if number != len(current) + 1:
-            if current:
-                runs.append(current)
-            if number != 1:
-                raise UnsupportedRecovery(
-                    f"visible page {page['index']} continues template run at {number}",
-                )
-            current = [(page["index"], number)]
-        else:
-            current.append((page["index"], number))
+        if number < 1:
+            raise UnsupportedRecovery("custom PDF page numbers must be positive")
+        if current and number != current[-1][1] + 1:
+            runs.append(current)
+            current = []
+        current.append((page["index"], number))
     if current:
         runs.append(current)
     return runs
@@ -341,6 +365,10 @@ def _bind_runs(runs: Sequence[Sequence[tuple[int, int]]],
     available = {name for names in by_count.values() for name in names}
     binding: dict[int, tuple[str, int]] = {}
     for run in runs:
+        if [number for _, number in run] != list(range(1, len(run) + 1)):
+            raise UnsupportedRecovery(
+                "partial template run requires a unique page-geometry binding",
+            )
         candidates = [n for n in by_count.get(len(run), []) if n in available]
         if len(candidates) != 1:
             raise UnsupportedRecovery(
@@ -370,10 +398,7 @@ def _geometry_matches(dims: Sequence[tuple[float, float]], pages: Sequence[dict]
         number = int(match.group(1))
         if not 1 <= number <= len(dims):
             return False
-        box = dims[number - 1]
-        scaled = box[1] * float(page["width"]) / box[0]
-        tolerance = max(4.0, 0.003 * float(page["height"]))
-        if abs(scaled - float(page["height"])) > tolerance:
+        if not _aspect_matches(dims[number - 1], page):
             return False
     return True
 
@@ -388,8 +413,13 @@ def _bind_runs_by_geometry(
     A note may attach the same document more than once, or attach a document
     whose page count differs from the visible run, so the run lengths cannot
     decide the binding.  The geometry can: every referenced page number must
-    exist and the visible height must match the embedded aspect.  The
-    assignment has to be unique, otherwise recovery stays ambiguous.
+    exist and the visible height must match the embedded aspect.  One attached
+    document may back several runs (each visible page references its own source
+    page), so every run may choose any geometrically compatible document; the
+    full assignment must be unique, otherwise recovery stays ambiguous.  A
+    document is deliberately *not* consumed by a run: excluding an already
+    used document from later runs would turn an unproven assignment into a
+    silent, potentially wrong binding.
     """
     by_index = {page["index"]: page for page in pages}
     candidates: list[list[str]] = []
@@ -407,20 +437,18 @@ def _bind_runs_by_geometry(
         candidates.append(options)
     solutions: list[list[str]] = []
 
-    def _assign(index: int, used: frozenset[str], choice: list[str]) -> None:
+    def _assign(index: int, choice: list[str]) -> None:
         if len(solutions) > 1:
             return
         if index == len(runs):
             solutions.append(list(choice))
             return
         for name in candidates[index]:
-            if name in used and len(candidates[index]) > 1:
-                continue
             choice.append(name)
-            _assign(index + 1, used | {name}, choice)
+            _assign(index + 1, choice)
             choice.pop()
 
-    _assign(0, frozenset(), [])
+    _assign(0, [])
     if len(solutions) != 1:
         raise UnsupportedRecovery(
             f"{len(solutions)} embedded document assignment(s) match the visible "
@@ -441,8 +469,10 @@ def _bind_pdfs(pages: Sequence[dict],
 
     One embedded document binds by direct page reference; several documents
     bind only via contiguous resetting runs matched uniquely by page count.
-    When the runs cannot decide the binding, the page geometry may still prove
-    a unique assignment, and that proof is used.
+    When the runs cannot decide the binding — shared counts, a run that starts
+    partway through a document, or a numbering gap that split a run — the page
+    geometry may still prove exactly one assignment, and only that proof is
+    used; anything ambiguous fails closed.
     """
     if len(sizes) == 1:
         return _bind_single(pages, sizes)
@@ -527,6 +557,103 @@ def _assert_background_only(content: str, page: dict) -> None:
         )
 
 
+def _preserve_navigation(output: Any, sources: dict[str, Any],
+                         binding: dict[int, tuple[str, int]]) -> None:
+    """Remap embedded bookmarks and named destinations to the assembled pages.
+
+    Copying page objects alone drops catalog-level navigation. Only destinations
+    whose source page has a unique copy are transferable: omitted pages have no
+    valid target, while duplicate copies cannot be disambiguated safely.
+    """
+    import pikepdf
+
+    all_names: dict[str, object] = {}
+    all_legacy: dict[str, object] = {}
+    with output.open_outline() as destination_outline:
+        for name, source in sources.items():
+            mapped: dict[tuple[int, int], list[int]] = {}
+            for index, (bound_name, page_number) in binding.items():
+                if bound_name == name:
+                    mapped.setdefault(source.pages[page_number].obj.objgen, []).append(index)
+            source_names = source.Root.get("/Names", {}).get("/Dests")
+            names = dict(pikepdf.NameTree(source_names).items()) if source_names is not None else {}
+            legacy = source.Root.get("/Dests", {})
+
+            def remap(value: Any) -> Any:
+                """Resolve a source destination and retain its exact PDF viewport."""
+                if isinstance(value, pikepdf.String):
+                    value = names.get(str(value))
+                elif isinstance(value, pikepdf.Name):
+                    value = legacy.get(str(value))
+                if isinstance(value, pikepdf.Dictionary):
+                    value = value.get("/D")
+                if not isinstance(value, pikepdf.Array) or len(value) < 2:
+                    raise UnsupportedRecovery(f"{name}: unsupported or unresolved PDF destination")
+                target = value[0]
+                objgen = getattr(target, "objgen", None)
+                if objgen is None:
+                    # pikepdf surfaces a PDF null target as None: the
+                    # destination names no page, so it has no provable target
+                    # and is dropped exactly like an omitted source page.
+                    return None
+                choices = mapped.get(objgen, [])
+                if not choices:
+                    return None
+                if len(choices) != 1:
+                    raise UnsupportedRecovery(f"{name}: navigation target has multiple visible copies")
+                # The remaining entries are a PDF fit-name and scalar coordinates.
+                return pikepdf.Array([output.pages[choices[0]].obj, *list(value)[1:]])
+
+            def copy_items(items: Sequence[Any]) -> list[Any]:
+                """Keep outline hierarchy and style without foreign page references."""
+                copied = []
+                for item in items:
+                    children = copy_items(item.children)
+                    target = item.destination
+                    action = item.action
+                    if action is not None:
+                        if str(action.get("/S")) != "/GoTo":
+                            raise UnsupportedRecovery(f"{name}: unsupported outline action")
+                        target = action.get("/D")
+                    destination = remap(target) if target is not None else None
+                    if destination is None and not children:
+                        continue
+                    obj = output.make_indirect(pikepdf.Dictionary())
+                    if item.obj is not None:
+                        if "/C" in item.obj:
+                            obj.C = pikepdf.Array(list(item.obj.C))
+                        if "/F" in item.obj:
+                            obj.F = int(item.obj.F)
+                    copied_item = pikepdf.OutlineItem(item.title, destination=destination, obj=obj)
+                    copied_item.is_closed = item.is_closed
+                    copied_item.children = children
+                    copied.append(copied_item)
+                return copied
+
+            with source.open_outline() as outline:
+                destination_outline.root.extend(copy_items(outline.root))
+            for key, value in names.items():
+                destination = remap(value)
+                if destination is not None:
+                    if key in all_names:
+                        raise UnsupportedRecovery(f"duplicate named destination: {key}")
+                    all_names[key] = destination
+            for key, value in legacy.items():
+                destination = remap(value)
+                if destination is not None:
+                    if str(key) in all_legacy:
+                        raise UnsupportedRecovery(f"duplicate legacy destination: {key}")
+                    all_legacy[str(key)] = destination
+    if all_names:
+        entries = []
+        for key in sorted(all_names):
+            entries.extend([pikepdf.String(key), all_names[key]])
+        output.Root.Names = pikepdf.Dictionary(
+            Dests=output.make_indirect(pikepdf.Dictionary(Names=pikepdf.Array(entries))))
+    if all_legacy:
+        output.Root.Dests = pikepdf.Dictionary(all_legacy)
+
+
 def recover(source: Path, work: Path, *, allow_ink_overlay: bool = False) -> tuple[Path, int, list[str]]:
     """Reconstruct a note whose paper is one or more embedded PDFs.
 
@@ -588,7 +715,15 @@ def recover(source: Path, work: Path, *, allow_ink_overlay: bool = False) -> tup
                 if index in binding:
                     name, number = binding[index]
                     if index not in overlay_indices:
-                        _assert_background_only(_content_stream(cli_pdf, index), page)
+                        try:
+                            _assert_background_only(_content_stream(cli_pdf, index), page)
+                        except UnsupportedRecovery:
+                            # A zero stroke count does not prove there is no
+                            # pasted image or typed/vector content. Preserve it
+                            # with the same checked transparent composition.
+                            if not allow_ink_overlay:
+                                raise
+                            overlay_indices.add(index)
                     out.pages.extend([sources[name].pages[number]])
                     if index in overlay_indices:
                         ink_paths[index] = _ink_streams(cli_pdf.pages[index], page, work)
@@ -612,6 +747,7 @@ def recover(source: Path, work: Path, *, allow_ink_overlay: bool = False) -> tup
                     raise UnsupportedRecovery(
                         f"visible page {index} dimensions were not preserved",
                     )
+            _preserve_navigation(out, sources, binding)
             out.save(output, compress_streams=True,
                      object_stream_mode=pikepdf.ObjectStreamMode.generate)
     finally:

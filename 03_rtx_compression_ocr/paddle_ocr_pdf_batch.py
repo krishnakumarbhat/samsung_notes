@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 import ctypes
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import shutil
 from typing import Any, Callable, Iterable
 
 
@@ -188,9 +190,9 @@ def build_ocr(
     if device_mode == "auto":
         device = "gpu:0" if detect_gpu_available() else "cpu"
     elif device_mode == "gpu":
-        device = "gpu:0" if detect_gpu_available() else "cpu"
-        if device == "cpu":
-            logger.warning("GPU requested but unavailable. Falling back to CPU.")
+        if not detect_gpu_available():
+            raise RuntimeError("GPU requested but unavailable; refusing silent CPU fallback")
+        device = "gpu:0"
     else:
         device = "cpu"
 
@@ -208,6 +210,21 @@ def build_ocr(
         "text_det_limit_side_len": ocr_max_side_len,
         "text_det_limit_type": "max",
     }
+    # Pin existing local models: constructor fallbacks can otherwise download
+    # unrelated default models, write outside the workspace or silently use CPU.
+    model_root = Path(__file__).resolve().parents[1] / "05_environments_and_venvs/models/paddleocr"
+    local_models = {
+        "text_detection": "PP-OCRv5_mobile_det",
+        "text_recognition": "PP-OCRv5_server_rec",
+    }
+    if use_textline_orientation:
+        local_models["textline_orientation"] = "PP-LCNet_x1_0_textline_ori"
+    for role, name in local_models.items():
+        directory = model_root / name
+        if not (directory / "inference.pdiparams").is_file():
+            raise RuntimeError(f"Missing local OCR model: {directory}; automatic downloads disabled")
+        primary_kwargs[f"{role}_model_name"] = name
+        primary_kwargs[f"{role}_model_dir"] = str(directory)
     if device.startswith("gpu"):
         primary_kwargs["text_detection_model_name"] = "PP-OCRv5_mobile_det"
         primary_kwargs["text_recognition_batch_size"] = 1
@@ -234,24 +251,7 @@ def build_ocr(
         if use_textline_orientation:
             primary_kwargs["textline_orientation_batch_size"] = 2
 
-    def _create_ocr(target_device: str) -> PaddleOCR:
-        attempts = [
-            dict(primary_kwargs, device=target_device),
-            {"lang": lang, "device": target_device},
-            {"lang": lang, "device": target_device},
-            {"lang": lang},
-        ]
-
-        for kwargs in attempts:
-            try:
-                return PaddleOCR(**kwargs)
-            except Exception as exc:
-                logger.debug("PaddleOCR init attempt failed with %s: %s", kwargs, exc)
-                continue
-
-        return PaddleOCR(lang=lang)
-
-    return _create_ocr(device)
+    return PaddleOCR(**primary_kwargs)
 
 
 def collect_pdfs(input_path: Path) -> tuple[Path, list[Path], bool]:
@@ -493,11 +493,11 @@ def page_has_native_text(page: PDFPage) -> bool:
     except Exception:
         return False
 
-    # Count visible characters only: a title page with a few glyphs and wide
-    # spacing must not look "text rich" and bypass OCR.
+    # Existing searchable text is authoritative. Never re-OCR a short title
+    # or sparse native/OCR page merely because it has fewer than 50 glyphs.
     clean_text = "".join(char for char in native_text
                          if char.isprintable() and not char.isspace()).strip()
-    return len(clean_text) >= 50
+    return bool(clean_text)
 
 
 def page_is_monochrome(page: PDFPage) -> bool:
@@ -629,13 +629,21 @@ def process_pdf(
     unicode_ocr = False
     # Identical template/diagram renders recur across pages and notes. Cache
     # regions by rendered bytes + processing profile, never by page number.
-    visual_cache = Path(__file__).resolve().parent / "ocr_visual_cache"
-    visual_cache.mkdir(exist_ok=True)
+    scratch_env = os.environ.get("TMPDIR")
+    if scratch_env:
+        scratch = Path(scratch_env).expanduser()
+    else:
+        scratch = Path(__file__).resolve().parents[2] / "sam_notes" / f"_run_tmp_{os.getpid()}"
+        scratch.mkdir(parents=True, exist_ok=True)
+        atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+    visual_cache = scratch / "ocr_visual_cache"
+    visual_cache.mkdir(parents=True, exist_ok=True)
     profile = hashlib.sha256(Path(__file__).read_bytes()).hexdigest() + str(
         getattr(get_ocr_engine, "cache_profile", "en-default")) + str(min_score) + "rot=1"
 
     source_page_count = len(doc)
-    with tempfile.TemporaryDirectory(prefix=f".{out_path.stem}.", dir=out_path.parent) as temp_dir:
+    with tempfile.TemporaryDirectory(prefix=f".{out_path.stem}.", dir=out_path.parent,
+                                     ignore_cleanup_errors=True) as temp_dir:
         temp_root = Path(temp_dir)
         fitz_temp = temp_root / "fitz-output.pdf"
         compressed_temp = temp_root / "qpdf-output.pdf"

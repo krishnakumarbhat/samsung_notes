@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Run every test suite with the correct interpreter and PYTHONPATH.
 
-The workspace intentionally keeps large package trees outside the repository
-(``../python_libs``, ``../python_libs_gpu`` and
-``05_environments_and_venvs/python_ocr_env``).  Running ``pytest`` by hand
+The workspace intentionally keeps package trees outside the repository
+(``../python_libs`` and ``../python_libs_gpu``). Running ``pytest`` by hand
 picks the wrong ``pytest`` or a broken plugin, so this launcher builds a
 coherent environment first.
 
@@ -16,11 +15,13 @@ Examples
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,7 +79,6 @@ def _venv_python(root: Path) -> Path | None:
         os.environ.get("SAM_PYTHON"),
         os.environ.get("OPENCODE_PYTHON"),
         str(Path(os.environ.get("SAM_VENV", "")) / "bin/python3") if os.environ.get("SAM_VENV") else None,
-        str(Path.home() / ".cache/sam_win/venv/bin/python3"),
         str(root / ".venv/bin/python3"),
         str(root / ".venv/Scripts/python.exe"),
         sys.executable,
@@ -98,27 +98,47 @@ def _site_roots(root: Path) -> list[Path]:
         root / "04_learning_recall_app/my_notes_graph",
         root / "02_extracted_notes_pdf/script",
         root / "03_rtx_compression_ocr",
-        root / "04_learning_recall_app/my_notes_graph/.venv/lib/python3.10/site-packages",
         parents / "python_libs_gpu/site-packages",
-        root / "05_environments_and_venvs/python_ocr_env/site-packages",
         parents / "python_libs/site-packages",
-        parents / "python_libs",
-        Path.home() / ".local/lib/python3.10/site-packages",
     ]
-    venv = root / "04_learning_recall_app/my_notes_graph/.venv/lib"
-    if venv.is_dir():
-        candidates.extend(sorted(venv.glob("python*/site-packages")))
     return [path for path in candidates if path.is_dir()]
 
 
 def build_env(root: Path) -> dict[str, str]:
     """Build a deterministic test environment without mutating the caller's."""
     env = dict(os.environ)
-    existing = env.get("PYTHONPATH", "")
-    parts = [str(path) for path in _site_roots(root)]
-    if existing:
-        parts.append(existing)
+    notes_root = root.parent / "sam_notes"
+    notes_root.mkdir(parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix=f"_run_tmp_{os.getpid()}.", dir=notes_root))
+    atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+    pytest_root = Path("/tmp/opencode")
+    pytest_root.mkdir(parents=True, exist_ok=True)
+    pytest_scratch = Path(tempfile.mkdtemp(prefix=f"sam_win_pytest_{os.getpid()}.", dir=pytest_root))
+    atexit.register(shutil.rmtree, pytest_scratch, ignore_errors=True)
+    env["SAM_NOTES_ROOT"] = str(notes_root)
+    env["SN_EXPORT_WORK"] = str(pytest_scratch)
+    # pytest tmp_path exercises private-mode token files; keep test scratch on
+    # the native host filesystem. Production runtime staging remains in sam_notes.
+    env["TMPDIR"] = str(pytest_scratch)
+    env["PADDLE_PDX_CACHE_HOME"] = str(scratch / "paddlex")
+    env["PADDLE_HOME"] = str(scratch / "paddle")
+    env["MPLCONFIGDIR"] = str(scratch / "matplotlib")
+    env["CUDA_CACHE_PATH"] = str(scratch / "cuda-cache")
+    for path in (env["PADDLE_PDX_CACHE_HOME"], env["PADDLE_HOME"],
+                 env["MPLCONFIGDIR"], env["CUDA_CACHE_PATH"]):
+        Path(path).mkdir(parents=True, exist_ok=True)
+    site_roots = _site_roots(root)
+    parts = [str(path) for path in site_roots]
     env["PYTHONPATH"] = os.pathsep.join(parts)
+    env["PYTHONNOUSERSITE"] = "1"
+    native_paths = []
+    for base in site_roots:
+        for pattern in ("nvidia/*/lib", "*.libs"):
+            native_paths.extend(str(path) for path in base.glob(pattern) if path.is_dir())
+    if native_paths:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            native_paths + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
+        )
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["HF_HUB_OFFLINE"] = "1"
@@ -126,6 +146,7 @@ def build_env(root: Path) -> dict[str, str]:
     env["TOKENIZERS_PARALLELISM"] = "false"
     env.setdefault("OMP_NUM_THREADS", "2")
     env.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+    env.setdefault("DISABLE_MODEL_SOURCE_CHECK", "True")
     return env
 
 

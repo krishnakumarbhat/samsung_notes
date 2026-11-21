@@ -33,7 +33,6 @@ PRIVATE_PREFIXES = (
     "02_extracted_notes_pdf/notes/",
     "02_extracted_notes_pdf/ai_agend_history/",
     "04_learning_recall_app/my_notes_graph/data/",
-    "05_environments_and_venvs/python_ocr_env/",
 )
 PRIVATE_SUFFIXES = (
     ".pdf",
@@ -203,6 +202,8 @@ def check_env_and_secrets(root: Path, files: list[Path]) -> list[Finding]:
 
     hits: list[str] = []
     for path in files:
+        if not path.is_file():
+            continue
         if not _is_text(path):
             continue
         relative = path.relative_to(root).as_posix()
@@ -232,7 +233,7 @@ def check_json(root: Path, files: list[Path]) -> list[Finding]:
     failures: list[str] = []
     checked = 0
     for path in files:
-        if path.suffix.lower() != ".json":
+        if path.suffix.lower() != ".json" or not path.is_file():
             continue
         try:
             if path.lstat().st_size > 20_000_000:
@@ -251,7 +252,7 @@ def check_python(root: Path, files: list[Path]) -> list[Finding]:
     failures: list[str] = []
     checked = 0
     for path in files:
-        if path.suffix != ".py":
+        if path.suffix != ".py" or not path.is_file():
             continue
         try:
             source = path.read_text(encoding="utf-8")
@@ -272,7 +273,7 @@ def check_shell(root: Path, files: list[Path]) -> list[Finding]:
     failures: list[str] = []
     checked = 0
     for path in files:
-        if path.suffix not in {".sh"} and not path.name.endswith(".bash"):
+        if (path.suffix not in {".sh"} and not path.name.endswith(".bash")) or not path.is_file():
             continue
         try:
             result = subprocess.run(
@@ -300,9 +301,9 @@ def check_markdown_links(root: Path, files: list[Path]) -> list[Finding]:
     """Validate relative links against files that will exist in a clean clone."""
     missing: list[str] = []
     checked = 0
-    tracked = {path.resolve() for path in files}
+    tracked = {path.resolve() for path in files if path.exists()}
     for path in files:
-        if path.suffix.lower() not in {".md", ".markdown"}:
+        if path.suffix.lower() not in {".md", ".markdown"} or not path.is_file():
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -345,7 +346,7 @@ def check_executables(root: Path, files: list[Path]) -> list[Finding]:
     expected = [
         path
         for path in files
-        if path.name != "__init__.py" and path.suffix in {".sh", ".py"} and (
+        if path.is_file() and path.name != "__init__.py" and path.suffix in {".sh", ".py"} and (
             path.parent.name in {"scripts"}
             or path.name in {"run_app.sh", "run_ocr.sh", "rebuild_index_offline.sh", "build-vm.sh"}
         )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import fcntl
 import hashlib
 import json
@@ -12,12 +13,22 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 from pymupdf_compat import fitz
 import pikepdf
 
 ROOT = Path(__file__).resolve().parents[1]
-ORIGINAL = ROOT / "02_extracted_notes_pdf/notes/original"
+PROJECT_ROOT = ROOT.parent
+SAM_NOTES_ROOT = Path(os.environ.get("SAM_NOTES_ROOT", str(PROJECT_ROOT.parent / "sam_notes"))).expanduser()
+_OWN_RUN_ROOT = not os.environ.get("SN_EXPORT_WORK")
+_DEFAULT_RUN_ROOT = SAM_NOTES_ROOT / f"_run_tmp_{os.getpid()}"
+WORK_ROOT = Path(
+    os.environ.get("SN_EXPORT_WORK", str(_DEFAULT_RUN_ROOT))
+).expanduser()
+if _OWN_RUN_ROOT:
+    atexit.register(shutil.rmtree, WORK_ROOT, ignore_errors=True)
+ORIGINAL = WORK_ROOT / "original"
 COMPRESSED = ROOT / "02_extracted_notes_pdf/notes/compressed"
 HISTORY = ROOT / "02_extracted_notes_pdf/ai_agend_history"
 MANIFEST = HISTORY / "derived_manifest.json"
@@ -30,7 +41,7 @@ def ocr_engine():
     if _OCR_ENGINE is None:
         from paddle_ocr_pdf_batch import build_ocr
         _OCR_ENGINE = build_ocr(lang="en", device_mode="gpu", ocr_max_side_len=2560,
-                                use_textline_orientation=False, cpu_threads=2)
+                                use_textline_orientation=False, cpu_threads=8)
     return _OCR_ENGINE
 
 
@@ -64,34 +75,45 @@ page_ocr_hook.cache_key = "paddle-ocr-v5-selective300-2560-sandwich3-" + hashlib
 
 
 def guard(reserve: int = 0, *, workspace_bound: bool = True) -> None:
-    """Enforce physical allocation guardrails including candidate output headroom.
+    """Enforce the 55 GB ceiling and free-space floor, including scratch.
 
-    ``workspace_bound=False`` is used when the scratch tree lives outside the
-    capped worktree: only the volume free-space floor still applies, because
-    the transient archive and render never touch the workspace.
-    ``SN_RELAX_DISK_GUARD=1`` lifts the workspace ceiling for a deliberate
-    one-off maintenance pass; the volume floor always applies.
+    The legacy workspace_bound argument is accepted but cannot bypass the cap.
     """
-    relaxed = os.environ.get("SN_RELAX_DISK_GUARD") == "1"
     used = int(subprocess.check_output(["du", "-s", "--block-size=1", str(ROOT)], text=True).split()[0])
-    if not relaxed and workspace_bound and used + reserve >= 55_000_000_000:
+    if used + reserve >= 55_000_000_000:
         raise RuntimeError("Disk budget prevents this derived PDF; original and placeholder retained")
     if shutil.disk_usage(ROOT).free - reserve < 15 * 1024**3:
         raise RuntimeError("Disk budget prevents this derived PDF; original and placeholder retained")
 
 
 def verify_pair(original: Path, candidate: Path) -> tuple[int, int]:
-    """Require equal page count/rendered pixels and no lost selectable text."""
+    """Require exact rendering, searchable text and navigational semantics."""
     after_chars = 0
     with fitz.open(original) as source, fitz.open(candidate) as output:
         if len(source) != len(output):
             raise ValueError("Derived PDF changed page count")
+        if _semantic_value(source.get_toc(simple=False)) != _semantic_value(output.get_toc(simple=False)):
+            raise ValueError("Derived PDF changed outline destinations")
+        if hasattr(source, "resolve_names") and _semantic_value(source.resolve_names()) != _semantic_value(output.resolve_names()):
+            raise ValueError("Derived PDF changed named destinations")
+        if source.get_page_labels() != output.get_page_labels():
+            raise ValueError("Derived PDF changed page labels")
         for before, after in zip(source, output):
+            if (tuple(before.mediabox), tuple(before.cropbox), before.rotation) != (tuple(after.mediabox), tuple(after.cropbox), after.rotation):
+                raise ValueError("Derived PDF changed page geometry")
+            if _semantic_value(before.get_links()) != _semantic_value(after.get_links()):
+                raise ValueError("Derived PDF changed hyperlinks or index jumps")
+            before_annots = [(a.type, a.info, tuple(a.rect)) for a in before.annots() or ()]
+            after_annots = [(a.type, a.info, tuple(a.rect)) for a in after.annots() or ()]
+            if _semantic_value(before_annots) != _semantic_value(after_annots):
+                raise ValueError("Derived PDF changed annotations")
             a = before.get_pixmap(matrix=fitz.Matrix(.5, .5), colorspace=fitz.csRGB, alpha=False)
             b = after.get_pixmap(matrix=fitz.Matrix(.5, .5), colorspace=fitz.csRGB, alpha=False)
-            if (a.width, a.height, a.samples) != (b.width, b.height, b.samples):
+            if not _visible_render_matches(a, b):
                 raise ValueError("Derived PDF changed visible content")
-            if len(after.get_text().strip()) < len(before.get_text().strip()):
+            old_text = " ".join(before.get_text().split())
+            new_text = " ".join(after.get_text().split())
+            if old_text and old_text not in new_text:
                 raise ValueError("Derived PDF lost native text")
             after_chars += len(after.get_text().strip())
         page_count = len(source)
@@ -99,6 +121,106 @@ def verify_pair(original: Path, candidate: Path) -> tuple[int, int]:
         if any("error" in str(issue).lower() for issue in parsed.check_pdf_syntax()):
             raise ValueError("Derived PDF syntax error")
     return page_count, after_chars
+
+
+def _visible_render_matches(before: Any, after: Any) -> bool:
+    """Accept only sub-pixel rasterizer noise, never meaningful page changes.
+
+    OCR adds invisible text and PDF reserialization may move antialias values by
+    one or two RGB levels across library builds.  Byte equality of raster
+    samples made otherwise equivalent searchable derivatives fail closed.  The
+    tolerance is intentionally tiny: dimensions must match, mean channel drift
+    must stay below 0.05, and no more than 0.01% of pixels may differ by >2.
+    """
+    if before.width != after.width or before.height != after.height:
+        return False
+    if before.samples == after.samples:
+        return True
+    import numpy as np
+
+    left = np.frombuffer(before.samples, dtype=np.uint8).astype(np.int16)
+    right = np.frombuffer(after.samples, dtype=np.uint8).astype(np.int16)
+    if left.shape != right.shape or left.size == 0 or left.size % 3:
+        return False
+    difference = np.abs(left - right).reshape((-1, 3))
+    mean_drift = float(difference.mean())
+    changed = np.any(difference > 2, axis=1)
+    return mean_drift <= 0.05 and float(changed.mean()) <= 0.0001
+
+
+def normalize_light_canvas(source: Path, work: Path) -> tuple[Path, list[str]]:
+    """Whiten provably dark note canvases before OCR and final validation.
+
+    The source is never modified.  Embedded-PDF paper must be handled by the
+    template recovery layer, because changing the source document would destroy
+    the user's original paper colors.  The caller is responsible for skipping
+    those notes.  Dark pages are detected from raster statistics, then the
+    structural normalizer changes only a page-sized dark fill or a dark image on
+    a dark page.  A still-dark page fails closed.
+    """
+    source, work = Path(source), Path(work)
+    import importlib
+
+    try:
+        color = importlib.import_module("pdf_color_normalize")
+    except ModuleNotFoundError:
+        color = importlib.import_module(
+            "02_extracted_notes_pdf.script.pdf_color_normalize"
+        )
+    normalize_pdf = color.normalize_pdf
+    render_page_stats = color.render_page_stats
+
+    stats = render_page_stats(source, scale=12 / 72)
+    dark_pages = [
+        int(item["index"])
+        for item in stats
+        if float(item.get("mean", 255)) < 80
+        and float(item.get("white_fraction", 0)) < 0.35
+    ]
+    if not dark_pages:
+        return source, []
+
+    output = work / f"{source.stem}.light-canvas.pdf"
+    report = normalize_pdf(source, output, dark_pages=dark_pages)
+    repaired = set(getattr(report, "repaired_pages", []))
+    if not repaired:
+        raise ValueError("dark canvas detected but no safe light-canvas repair was proven")
+    remaining = [
+        int(item["index"])
+        for item in render_page_stats(output, scale=12 / 72)
+        if int(item["index"]) in repaired
+        and float(item.get("mean", 255)) < 80
+        and float(item.get("white_fraction", 0)) < 0.35
+    ]
+    if remaining:
+        raise ValueError(f"dark canvas remains after normalization on page(s): {remaining[:8]}")
+    with fitz.open(source) as before, fitz.open(output) as after:
+        if len(before) != len(after):
+            raise ValueError("light-canvas normalization changed page count")
+        for left, right in zip(before, after):
+            if (tuple(left.mediabox), tuple(left.cropbox), left.rotation) != (
+                tuple(right.mediabox), tuple(right.cropbox), right.rotation
+            ):
+                raise ValueError("light-canvas normalization changed page geometry")
+            old_text = " ".join(left.get_text().split())
+            new_text = " ".join(right.get_text().split())
+            if old_text and old_text not in new_text:
+                raise ValueError("light-canvas normalization lost native text")
+    return output, [f"light-canvas-normalized:{','.join(map(str, sorted(repaired)))}"]
+
+
+def _semantic_value(value: Any) -> Any:
+    """Normalize navigation values while excluding serialization-only IDs."""
+    if isinstance(value, dict):
+        return {key: _semantic_value(item) for key, item in value.items()
+                if key not in ("xref", "id")}
+    if isinstance(value, (list, tuple)):
+        return [_semantic_value(item) for item in value]
+    if isinstance(value, (fitz.Point, fitz.Rect)):
+        return [round(float(item), 5) for item in value]
+    if isinstance(value, float):
+        return round(value, 5)
+    return value
 
 
 def verify_equivalent(original: Path, candidate: Path, *, max_mean_drift: float = 3.0,
@@ -179,86 +301,144 @@ def verify_equivalent(original: Path, candidate: Path, *, max_mean_drift: float 
     return len(before_stats), after_chars
 
 
-def derive_file(source: Path, *, ocr: bool = False, max_ocr_pages: int = 1000) -> dict:
-    """Create a lossless derivative under strict space/fidelity checks, atomically."""
+def share_source(source: Path, candidate: Path) -> None:
+    """Stage independent bytes, never a link whose source may be deleted."""
+    candidate.unlink(missing_ok=True)
+    shutil.copyfile(source, candidate)
+
+
+def _preserve_previous_target(target: Path, new_sha: str) -> Path | None:
+    """Move/copy a differing previous PDF into private history before replacement.
+
+    A regular target is moved atomically. A valid symlink is preserved as the
+    bytes it resolves to, while a broken symlink is archived as a symlink.
+    Equal-content replacements need no backup. The returned backup path lets
+    the caller restore a moved old target if atomic publication subsequently
+    fails.
+    """
+    if not (target.exists() or target.is_symlink()):
+        return None
+    try:
+        old_sha = digest(target)
+    except OSError:
+        old_sha = None
+    if old_sha == new_sha:
+        return None
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime()) + f"-{time.time_ns()}"
+    relative = target.relative_to(COMPRESSED)
+    backup = HISTORY / "preserved_originals" / "replaced_exports" / stamp / relative
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    if backup.exists() or backup.is_symlink():
+        backup = backup.with_name(f"{backup.stem}-{time.time_ns()}{backup.suffix}")
+    if target.is_symlink() and old_sha is not None:
+        # A relative symlink can break when relocated. Preserve its PDF bytes
+        # independently; the referent itself is never unlinked.
+        shutil.copy2(target.resolve(), backup)
+        return None
+    os.replace(target, backup)
+    return backup
+
+
+def derive_file(source: Path, *, target: Path | None = None, ocr: bool = False,
+                max_ocr_pages: int = 1000) -> dict:
+    """Atomically publish the smallest verified lossless standalone candidate.
+
+    Existing compression algorithms are used in strict lossless mode; the PDF
+    graph is never rasterized. If optimization cannot preserve every checked
+    feature, exact source bytes are used rather than silently losing content.
+    """
     source = source.absolute()
-    relative = source.relative_to(ORIGINAL)
-    target = COMPRESSED / relative
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("Compression requires a real staged PDF")
+    try:
+        relative = source.relative_to(ORIGINAL)
+    except ValueError:
+        relative = Path(source.name)
+        if target is None:
+            raise ValueError("Non-staging source needs an explicit target")
+    target = Path(target) if target is not None else COMPRESSED / relative
+    if target.absolute() == source:
+        raise ValueError("Source and destination must differ")
+    target.absolute().relative_to(COMPRESSED.absolute())
+    target.parent.resolve().relative_to(COMPRESSED.resolve())
     target.parent.mkdir(parents=True, exist_ok=True)
     before_sha = digest(source)
     with fitz.open(source) as pdf:
-        sparse = [i + 1 for i, page in enumerate(pdf) if len(page.get_text().strip()) < 50]
+        sparse = [i + 1 for i, page in enumerate(pdf) if not page.get_text().strip()]
         count = len(pdf)
         if count < 1:
             raise ValueError("Original PDF has no visible pages")
         native_chars = sum(len(page.get_text().strip()) for page in pdf)
-        featureless = []
-        for page_number in sparse:
-            pix = pdf[page_number - 1].get_pixmap(matrix=fitz.Matrix(.5, .5), colorspace=fitz.csGRAY, alpha=False)
-            if pix.samples and pix.samples.count(pix.samples[0]) == len(pix.samples):
-                featureless.append(page_number)
-    needs_ocr = [number for number in sparse if number not in featureless]
-    if ocr and not needs_ocr:
-        # An already-searchable PDF (possibly with blank pages) needs no second
-        # full-sized copy. A distinct path shares the immutable source inode.
-        guard(65536)
-        with tempfile.TemporaryDirectory(prefix=".derive-", dir=target.parent) as temporary:
-            candidate = Path(temporary) / source.name
-            os.link(source, candidate)
-            if digest(candidate) != before_sha:
-                raise ValueError("Original changed before native hard-link publication")
-            os.replace(candidate, target)
-        return {"source": str(relative), "source_sha256": before_sha, "sha256": before_sha,
-                "pages": count, "chars": native_chars, "sparse_pages": 0, "ocr": False,
-                "status": "searchable" if native_chars else "no_text",
-                "source_bytes": source.stat().st_size, "derived_bytes": target.stat().st_size,
-                "storage": "hardlink-native-or-featureless"}
     if ocr and len(sparse) > max_ocr_pages:
-        return {"source": str(relative), "status": "deferred_ocr_page_budget", "sparse_pages": len(sparse)}
-    guard(source.stat().st_size * 2 + 16 * 1024**2)
-    with tempfile.TemporaryDirectory(prefix=".derive-", dir=target.parent) as temporary:
+        raise ValueError("OCR page budget exceeded; previous output retained")
+    guard(source.stat().st_size * 3 + 16 * 1024**2)
+    warnings = []
+    did_ocr = False
+    with pikepdf.open(source) as parsed:
+        immutable = (parsed.is_encrypted or "/Perms" in parsed.Root or any(
+            isinstance(obj, pikepdf.Dictionary) and str(obj.get("/Type")) == "/Sig"
+            for obj in parsed.objects))
+    if immutable and ocr:
+        raise ValueError("Signed/encrypted PDFs cannot be changed safely for OCR")
+    WORK_ROOT.mkdir(parents=True, exist_ok=True)
+    if os.stat(WORK_ROOT).st_dev != os.stat(target.parent).st_dev:
+        raise RuntimeError(
+            "SN_EXPORT_WORK and the PDF destination must share a filesystem "
+            "for atomic publication; use the sibling sam_notes run scratch"
+        )
+    with tempfile.TemporaryDirectory(prefix=".derive-", dir=WORK_ROOT,
+                                     ignore_cleanup_errors=True) as temporary:
         work = Path(temporary)
-        candidate = work / source.name
+        base = source
         if ocr and sparse:
             from paddle_ocr_pdf_batch import process_pdf
+            base = work / "searchable.pdf"
             with (HISTORY / "gpu_ocr.lock").open("w") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
-                process_pdf(source, candidate, ocr_engine, dpi=300, ocr_max_side_len=2560,
+                process_pdf(source, base, ocr_engine, dpi=300, ocr_max_side_len=2560,
                             min_score=.6, force_ocr=False)
-        else:
-            with pikepdf.Pdf.open(source) as pdf:
-                pdf.remove_unreferenced_resources()
-                pdf.save(candidate, compress_streams=True, recompress_flate=True,
-                         object_stream_mode=pikepdf.ObjectStreamMode.generate)
-        # Re-encode the page images at their exact pixel size: the resolution
-        # never changes, only the codec does, which is where the size is won.
+            verify_pair(source, base)
+            did_ocr = True
         from pdf_compress import compress as compress_pdf
-
-        reencoded = work / "reencoded.pdf"
+        candidate = work / "optimized.pdf"
         try:
-            compress_pdf(candidate, reencoded, verify=False)
+            if immutable:
+                share_source(base, candidate)
+            else:
+                compress_pdf(base, candidate, lossless=True, verify=True)
+            page_count, chars = verify_pair(base, candidate)
         except Exception as exc:
-            logger.warning("image re-encoding skipped for %s: %s", source.name, exc)
-            reencoded = candidate
-        if reencoded.is_file() and reencoded.stat().st_size < candidate.stat().st_size:
-            candidate.unlink()
-            candidate = reencoded
-        page_count, chars = verify_equivalent(source, candidate)
+            warnings.append(f"Lossless optimization fallback: {type(exc).__name__}: {exc}")
+            share_source(base, candidate)
+            page_count, chars = verify_pair(base, candidate)
+        if candidate.stat().st_size >= base.stat().st_size:
+            share_source(base, candidate)
+        if not did_ocr:
+            # The exact-byte fallback is already structurally identical.
+            chars = native_chars
         if digest(source) != before_sha:
             raise ValueError("Original changed during derived compilation")
-        # No smaller output and no OCR benefit: use a hard link, not a duplicate.
-        # Future writes always use replace(), so the original inode stays untouched.
-        if candidate.stat().st_size >= source.stat().st_size and not (ocr and sparse):
-            candidate.unlink()
-            os.link(source, candidate)
         after_sha = digest(candidate)
         with candidate.open("rb") as stream:
             os.fsync(stream.fileno())
-        os.replace(candidate, target)  # replaces the placeholder itself, never its referent
+        guard()
+        previous = _preserve_previous_target(target, after_sha)
+        try:
+            os.replace(candidate, target)
+        except Exception:
+            if previous is not None and not (target.exists() or target.is_symlink()):
+                os.replace(previous, target)
+            raise
+        directory_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     return {"source": str(relative), "source_sha256": before_sha, "sha256": after_sha,
             "pages": page_count, "chars": chars, "sparse_pages": len(sparse),
-            "ocr": bool(ocr and sparse), "status": "searchable" if chars else "no_text",
-            "source_bytes": source.stat().st_size, "derived_bytes": target.stat().st_size}
+            "ocr": did_ocr, "status": "searchable" if chars else "no_text",
+            "source_bytes": source.stat().st_size, "derived_bytes": target.stat().st_size,
+            "storage": "standalone", "warnings": warnings}
 
 
 def process_corpus(ocr: bool = False, limit: int | None = None,

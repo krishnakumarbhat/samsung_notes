@@ -15,11 +15,12 @@ flowchart LR
 
     subgraph Host["Linux host"]
         SYNC[00_orchestrator<br/>sync_and_export_notes.sh]
+        REC[Phase 0 UUID tree reconciler]
         EXP[02 incremental exporter<br/>sdocx-cli + page_delta]
-        PDF[(notes/original)]
-        REP[PDF repair<br/>template recovery<br/>colour normalise]
+        STAGE[(external sam_notes/_run_tmp_<pid>)]
+        REP[UUID tree reconcile<br/>template recovery<br/>light-canvas normalise]
         OCR[03 PaddleOCR bridge<br/>invisible text layer]
-        CMP[(notes/compressed)]
+        CMP[(notes/compressed<br/>canonical PDF store)]
         IDX[04 local_index.py<br/>BGE-small + BM25 + RRF]
         SQL[(data/local_index.sqlite)]
         APP[FastAPI dashboard<br/>FSRS + tutor + exam]
@@ -31,13 +32,12 @@ flowchart LR
     SSH --> DB
     SSH --> WDOC
     SYNC --> SSH
-    SYNC --> EXP
-    EXP --> PDF
-    PDF --> REP
-    REP --> PDF
-    PDF --> OCR
+    SYNC --> REC
+    REC --> EXP
+    EXP --> STAGE
+    STAGE --> REP
+    REP --> OCR
     OCR --> CMP
-    PDF --> CMP
     CMP --> IDX
     IDX --> SQL
     SQL --> APP
@@ -53,27 +53,36 @@ flowchart LR
    `sync_now.sh`+`click_sync.ps1` to the guest, clicks **Sync now** through the
    interactive session, and waits for `IsDirty=0` plus read-only WDoc
    quiescence.
-2. **Delta export** — `02_extracted_notes_pdf/script/incremental_export.py`
-   inventories `Storage.sqlite` with `mode=ro`, compares modification times and
-   content hashes in `incremental_state.sqlite`, and renders only changed pages.
-   Page artifacts are cached by a content hash that includes page bytes,
-   referenced media, renderer version/config and layout dependencies.
-3. **Repair and normalise** — `pdf_template_recovery.py` fixes legacy exports
+2. **UUID tree reconcile** — `reconcile_tree.py` takes one fresh guest inventory
+   through a `mode=ro`/`query_only` SQLite helper. It matches by UUID, then
+   manifest/state path and unique SHA-256. A moved/renamed unchanged UUID updates
+   paths in place; it does not render, OCR or re-embed. Conflicts, recycled
+   notes and unmapped PDFs are preserved in history archives. This project is
+   compressed-only: it does not create or populate `notes/original/`.
+3. **Delta export** — `incremental_export.py` compares modification time, title,
+   folder and payload signatures in `incremental_state.sqlite`, then renders
+   only changed/new/missing notes. Raw WDoc and candidates live under external
+   `$SN_EXPORT_WORK` and are removed when the owning run exits. Page artifacts are cached
+   by a content hash covering page bytes, media dependencies and renderer
+   version/configuration.
+4. **Repair and normalise** — `pdf_template_recovery.py` fixes legacy exports
    whose page count is correct but whose embedded PDF paper is missing. It reads
    visible order only from `pageIdInfo.dat`, binds `custom PDF page N` to
    `media/<name>.pdf` page `N-1`, proves the CLI drew only a background fill, and
-   fails closed on ink overlays. `pdf_color_normalize.py` repairs black-canvas
-   pages. Originals are preserved before any atomic publication.
-4. **OCR** — `03_rtx_compression_ocr/paddle_ocr_pdf_batch.py` skips pages with
+   fails closed on ambiguous bindings. `pdf_color_normalize.py` whitens proven
+   dark canvases before final derivation validation; embedded source-PDF paper
+   is not modified.
+5. **OCR** — `03_rtx_compression_ocr/paddle_ocr_pdf_batch.py` skips pages with
    ≥50 clean selectable characters, renders sparse pages, tries 0°/90°/270°,
-   maps boxes back to the upright page, inserts invisible text, verifies page
-   count and pixel equality, then losslessly compresses with pikepdf.
-5. **Index** — `04_learning_recall_app/my_notes_graph/src/local_index.py`
+   maps boxes back to the upright page, inserts invisible text, preserves native
+   text, and uses conservative raster-drift validation before lossless
+   compression with pikepdf.
+6. **Index** — `04_learning_recall_app/my_notes_graph/src/local_index.py`
    discovers every PDF, classifies it as `searchable`, `empty` or `unreadable`,
    chunks page-aware text, and stores BM25 terms plus local BGE-small vectors in
    `data/local_index.sqlite`. Retrieval fuses lexical and dense ranks with
    reciprocal-rank fusion (`k=60`); no note text is sent to an embedding API.
-6. **Study** — `00_main.py` and `engine/routes.py` serve the dashboard. Gemini
+7. **Study** — `00_main.py` and `engine/routes.py` serve the dashboard. Gemini
    is used only for reasoning (tutor, exam grading, question factory), with a
    server-side answer key, `countTokens` below the budget, bounded jittered
    retries, and immediate stop on 401/403.
@@ -82,10 +91,13 @@ flowchart LR
 
 ```
 02_extracted_notes_pdf/
-  notes/original/       exact migrated exports, never written by OCR
-  notes/compressed/     relative placeholders, hard links, or verified derivatives
+  notes/compressed/     sole canonical standalone PDF store
+  notes/original/       legacy-only; must not be populated in compressed-only mode
   notes/export_manifest.json
-  ai_agend_history/     state DBs, reports, preserved originals, page cache
+  ai_agend_history/     state DBs, reports, safe archives, page cache
+../python_libs_gpu/site-packages/  shared CUDA/Paddle/Torch packages
+../python_libs/site-packages/     shared CPU and application packages
+../sam_notes/_run_tmp_<pid>/      ephemeral run staging, removed on exit
 04_learning_recall_app/my_notes_graph/
   data/local_index.sqlite   BM25 + dense index
   data/recall.sqlite        FSRS cards, logs, quiz bank, games
@@ -93,12 +105,9 @@ flowchart LR
   data/index.json           legacy JSON index (preserved)
 ```
 
-`notes/compressed/` entries can be:
-
-- a **relative symlink** to the original when no derivative is needed;
-- a **hard link** when the original is already searchable;
-- a **real PDF** when OCR or lossless compression produced a verified
-  derivative.
+`notes/compressed/` contains verified real PDFs. Prior differing versions,
+duplicate copies and unambiguous orphans are moved into ignored private history
+archives before replacement or pruning.
 
 Publication always replaces the link atomically and never follows it for an
 in-place write.

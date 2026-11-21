@@ -32,5 +32,3 @@
 # GitHub language statistics
 tools/sdocx-cli linguist-vendored
 04_learning_recall_app/my_notes_graph/static/vendor/** linguist-vendored
-01_vm_windows_sync/guestsetup/*.exe linguist-vendored
-01_vm_windows_sync/guestsetup/get-pip.py linguist-vendored

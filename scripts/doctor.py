@@ -21,6 +21,7 @@ import os
 import platform
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -77,25 +78,82 @@ def _tree_bytes(path: Path) -> int:
     return total
 
 
-def _database_password_present(path: Path) -> bool:
-    """Report whether a password key exists without ever logging its value."""
+def _password_key_present(path: Path) -> bool:
+    """Report whether a credential key exists without ever logging its value."""
     if not path.is_file():
-        return bool(os.environ.get("SAMSUNG_NOTES_PASSWORD"))
+        return False
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         key, _, value = line.partition("=")
         if key.strip() in {"SAMSUNG_NOTES_PASSWORD", "SAM_PASSWORD"}:
             return bool(value.strip().strip("\"'"))
-    return bool(os.environ.get("SAMSUNG_NOTES_PASSWORD"))
+    return False
+
+
+def _guest_credential() -> tuple[bool, str]:
+    """Locate the guest credential: env, native store, then legacy project file.
+
+    The project ``02_extracted_notes_pdf/.env`` is read only when the native
+    ``~/.config/sam_win/.env`` has no credential key. No value is ever returned
+    or printed; callers receive only presence and the source description.
+    """
+    if os.environ.get("SAMSUNG_NOTES_PASSWORD") or os.environ.get("SAM_PASSWORD"):
+        return True, "environment"
+    native = Path.home() / ".config/sam_win/.env"
+    if _password_key_present(native):
+        return True, str(native)
+    legacy = ROOT / "02_extracted_notes_pdf/.env"
+    if _password_key_present(legacy):
+        return True, str(legacy)
+    return False, ""
 
 
 def _python_import(name: str) -> tuple[bool, str]:
     """Test an import in this interpreter without importing it into the doctor."""
+    package_roots = [
+        ROOT.parent / "python_libs_gpu/site-packages",
+        ROOT.parent / "python_libs/site-packages",
+    ]
+    package_roots = [str(path) for path in package_roots if path.is_dir()]
+    env = os.environ.copy()
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+    env["DISABLE_MODEL_SOURCE_CHECK"] = "True"
+    if package_roots:
+        env["PYTHONPATH"] = os.pathsep.join(package_roots)
+    native_roots = [
+        ROOT.parent / "python_libs_gpu/site-packages",
+        ROOT.parent / "python_libs/site-packages",
+    ]
+    native_paths = []
+    for base in native_roots:
+        native_paths.extend(str(path) for pattern in ("nvidia/*/lib", "*.libs")
+                            for path in base.glob(pattern) if path.is_dir())
+    if native_paths:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            native_paths + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
+        )
     code = (
         "import importlib,sys;"
         f"m=importlib.import_module({name!r});"
         "print(getattr(m,'__version__','ok'))"
     )
-    code_status, output = _run([sys.executable, "-c", code], 45)
+    if name == "paddle":
+        code = (
+            "import importlib,sys;"
+            f"sys.path.insert(0,{str(ROOT / '00_orchestrator')!r});"
+            "m=importlib.import_module('paddle');"
+            "from gpu_preflight import check;"
+            "print(check(m))"
+        )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True,
+            timeout=45, check=False, env=env,
+        )
+        code_status = completed.returncode
+        output = (completed.stdout + completed.stderr).strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        code_status, output = 127, str(exc)
     return code_status == 0, output.splitlines()[-1] if output else "unknown"
 
 
@@ -191,12 +249,15 @@ def collect(mode: str) -> list[Check]:
 
     if mode in {"core", "all"}:
         checks.extend(_disk_checks())
+        native_env = Path.home() / ".config/sam_win/.env"
+        env_private = native_env.is_file() and not (stat.S_IMODE(native_env.stat().st_mode) & 0o077)
         checks.append(
             Check(
                 "secure env file",
-                "ok" if (Path.home() / ".config/sam_win/.env").is_file() else "warn",
-                str(Path.home() / ".config/sam_win/.env")
-                + (" present" if (Path.home() / ".config/sam_win/.env").is_file() else " absent (optional until Gemini is used)"),
+                "ok" if env_private else "warn",
+                str(native_env)
+                + (" present with private mode" if env_private
+                   else " absent or group/world-accessible (recommended mode 600)"),
                 required=False,
             )
         )
@@ -277,20 +338,20 @@ def collect(mode: str) -> list[Check]:
                 group="export",
             )
         )
-        env_file = ROOT / "02_extracted_notes_pdf/.env"
+        present, source = _guest_credential()
         checks.append(
             Check(
                 "guest SSH password",
-                "ok" if _database_password_present(env_file) else "fail",
-                "SAMSUNG_NOTES_PASSWORD present (value not printed)"
-                if _database_password_present(env_file)
-                else "set SAMSUNG_NOTES_PASSWORD in 02_extracted_notes_pdf/.env",
+                "ok" if present else "fail",
+                f"SAMSUNG_NOTES_PASSWORD present in {source} (value not printed)"
+                if present
+                else "set SAMSUNG_NOTES_PASSWORD in ~/.config/sam_win/.env",
                 group="export",
             )
         )
 
     if mode in {"ocr", "all"}:
-        for module in ("fitz", "pikepdf", "numpy"):
+        for module in ("fitz", "pikepdf", "numpy", "paddle"):
             ok, detail = _python_import(module)
             checks.append(
                 Check(

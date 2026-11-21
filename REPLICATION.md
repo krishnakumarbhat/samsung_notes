@@ -23,7 +23,7 @@ metadata, evidence) or **in one bundle** (notes, history, model, app data, VM).
 | Exported PDFs (`02_.../notes/`) | No | 12 GB, personal notes | Bundle / rsync |
 | VM disk (`01_.../vm/notes.qcow2`) | No | 34 GB, Windows licence | Copy or rebuild |
 | Model weights (133 MB) | No | Re-downloadable, >99 MB | `fetch_models.py` |
-| Python packages (`05_.../python_ocr_env`, `../python_libs*`) | No | Reinstallable, multi-GB | `bootstrap.sh` |
+| Python packages (`../python_libs`, `../python_libs_gpu`) | No | Reinstallable, multi-GB | `bootstrap.sh` |
 | `.env` secrets | No | Credentials | Enter manually |
 
 The GitHub hard limit is 100 MB per file. This repository enforces a **99 MB**
@@ -105,19 +105,19 @@ bash scripts/bootstrap.sh --ocr-gpu
 bash scripts/bootstrap.sh --models
 ```
 
-The venv lives at `~/.cache/sam_win/venv` by default, **outside** the project.
-Override with `SAM_VENV=/path`. Never create a venv on an NTFS/external mount.
+The host's existing Python interpreter is used by default. If a custom
+interpreter is required, set `SAM_PYTHON` to an existing executable; package
+imports still come only from the shared CPU/GPU libraries.
 
 Activate the runtime resolver:
 
 ```bash
-export SAM_PYTHON="$HOME/.cache/sam_win/venv/bin/python3"
 source 00_orchestrator/runtime.sh
 ```
 
-`runtime.sh` also discovers the legacy shared package trees (`../python_libs`,
-`../python_libs_gpu`, `05_.../python_ocr_env`) when they exist, so both the old
-and the bootstrapped layouts work.
+`runtime.sh` loads packages only from `../python_libs_gpu` and
+`../python_libs`; transient run scratch is created below `../sam_notes/` and
+removed on exit.
 
 ---
 
@@ -177,7 +177,7 @@ python3 scripts/assets_manifest.py verify --hash
 
 ```bash
 rsync -aH --info=progress2 \
-  --exclude='.git' --exclude='05_environments_and_venvs/python_ocr_env' \
+  --exclude='.git' \
   --exclude='__pycache__' --exclude='*.pyc' --exclude='page_cache' \
   old-host:/path/to/sam_win/ ./sam_win/
 ```

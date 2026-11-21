@@ -185,9 +185,13 @@ def _source_name(path: Path, pdf_root: Path, original_root: Path) -> str:
 
 
 def _folder_of(source: str) -> str:
-    """Top-level export folder used for coverage and scoped search."""
+    """Return the guest top-level folder, or empty for a true root note.
+
+    Do not synthesize ``Uncategorized`` for notes whose guest CategoryUUID has
+    no folder ancestry; that would diverge from CategoryTreeDB.
+    """
     parts = Path(source).parts
-    return parts[0] if len(parts) > 1 else "Uncategorized"
+    return parts[0] if len(parts) > 1 else ""
 
 
 # --------------------------------------------------------------------------- #

@@ -61,17 +61,20 @@ HIST = ROOT / "ai_agend_history"
 PAGE_CACHE_DIR = Path(os.environ.get("SN_PAGE_CACHE_DIR", str(HIST / "page_cache")))
 CACHE_SCHEMA = "page-delta-v1"
 
-PROJECT_CAP_BYTES = 55 * 1024**3
+PROJECT_CAP_BYTES = 55_000_000_000
 FREE_FLOOR_BYTES = 15 * 1024**3
 # A page cache is derived data; keep it small because the worktree is near cap.
 PAGE_CACHE_LIMIT_BYTES = 256 * 1024**2
 
 _PAGE_MANIFEST = "pageIdInfo.dat"
 _INTEGRITY_BYTES = 32
+_PREFIX_RE = re.compile(r"[0-9a-f]{2}\Z")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 SearchableHook = Callable[[Path, str, Path], Path | None]
 
-__all__ = ["compile_note", "PageDeltaError", "UnsupportedMapping", "SearchableHook"]
+__all__ = ["compile_note", "prune_cache", "PageDeltaError", "UnsupportedMapping",
+           "SearchableHook"]
 
 
 class PageDeltaError(RuntimeError):
@@ -237,9 +240,9 @@ def _ordered_visible_pages(
     missing = [page_id for page_id in ids if page_id not in names]
     if missing:
         raise UnsupportedMapping("manifest references missing .page entries: " + ",".join(missing[:4]))
-    unlisted = sorted(set(names) - set(ids))
-    if unlisted:
-        raise UnsupportedMapping("unlisted .page entries: " + ",".join(unlisted[:4]))
+    # pageIdInfo.dat is the authoritative visible order. Archives can retain
+    # stale `.page` payloads that are not referenced by it; they are not visible
+    # pages and must not poison an otherwise exact page-count mapping.
     indexes = [int(page.get("index", -1)) for page in page_info]
     if indexes != list(range(count)):
         raise UnsupportedMapping("CLI page indexes are not a complete 0-based range")
@@ -524,7 +527,7 @@ def _free_bytes(path: Path) -> int:
 
 
 class _WriteBudget:
-    """Enforce the 55 GiB workspace ceiling, 15 GiB floor and cache ceiling."""
+    """Enforce the 55 GB workspace ceiling, 15 GiB floor and cache ceiling."""
 
     def __init__(self) -> None:
         self.project_bytes = _tree_bytes(PROJECT_ROOT)
@@ -544,13 +547,142 @@ class _WriteBudget:
             return False
         cache_inside_workspace = PAGE_CACHE_DIR.resolve().is_relative_to(PROJECT_ROOT.resolve())
         if cache_inside_workspace and self.project_bytes + self.written + additional > PROJECT_CAP_BYTES:
-            self.reason = "workspace ceiling (55 GiB) would be exceeded"
+            self.reason = "workspace ceiling (55 GB) would be exceeded"
             return False
         return True
 
     def commit(self, size: int) -> None:
         """Account for a completed cache write."""
         self.written += size
+
+
+def _iter_shard_entries(schema_root: Path) -> Iterator[Path]:
+    """Yield only cache-owned SHA256 shard directories under the schema root.
+
+    A cache-owned entry is exactly ``<root>/<2-hex>/<64-hex>/`` with no symlinks
+    in the path. Manifests, locks, temp files and unknown names are ignored.
+    """
+    try:
+        if not schema_root.is_dir() or schema_root.is_symlink():
+            return
+        root_real = schema_root.resolve()
+        for prefix in sorted(schema_root.iterdir()):
+            if prefix.is_symlink() or not prefix.is_dir():
+                continue
+            if not _PREFIX_RE.fullmatch(prefix.name):
+                continue
+            for entry in sorted(prefix.iterdir()):
+                if entry.is_symlink() or not entry.is_dir():
+                    continue
+                if not _SHA256_RE.fullmatch(entry.name):
+                    continue
+                if not entry.resolve().is_relative_to(root_real):
+                    continue
+                yield entry
+    except OSError:
+        return
+
+
+def _manifest_keys(schema_root: Path) -> set[str]:
+    """Collect page keys referenced by structurally valid per-note manifests."""
+    keys: set[str] = set()
+    notes = schema_root / "notes"
+    if not notes.is_dir() or notes.is_symlink():
+        return keys
+    try:
+        paths = list(notes.glob("*.json"))
+    except OSError:
+        return keys
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("schema") != CACHE_SCHEMA:
+            continue
+        pages = data.get("pages")
+        if not isinstance(pages, list) or data.get("count") != len(pages):
+            continue
+        found: list[str] = []
+        for page in pages:
+            if not isinstance(page, dict):
+                found = []
+                break
+            key = page.get("key")
+            if not isinstance(key, str) or not _SHA256_RE.fullmatch(key):
+                found = []
+                break
+            found.append(key)
+        keys.update(found)
+    return keys
+
+
+def _entry_recency(entry: Path) -> int:
+    """Nanosecond last-use stamp; zero for unreadable entries (evicted first)."""
+    try:
+        return entry.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _touch_entry(entry: Path) -> None:
+    """Record a cache hit as recent use without rewriting cache metadata."""
+    try:
+        os.utime(entry, None)
+    except OSError:
+        pass
+
+
+def prune_cache(max_bytes: int | None = None) -> dict:
+    """Bound the page cache by evicting orphan then least-recently-used entries.
+
+    Only SHA256 shard directories directly beneath ``PAGE_CACHE_DIR/CACHE_SCHEMA``
+    are candidates. Keys named by valid per-note manifests are protected; while
+    the cache is under the limit nothing is evicted. Once over the limit,
+    unreferenced (orphan) entries go first, then protected entries in
+    least-recently-used order, stopping as soon as the limit is met. Manifests,
+    the lock, foreign paths and every file outside the page cache are untouched.
+
+    Callers should hold ``_cache_lock`` to avoid racing a concurrent export.
+    Returns counters plus the resulting byte total for auditing.
+    """
+    limit = PAGE_CACHE_LIMIT_BYTES if max_bytes is None else max(0, int(max_bytes))
+    schema_root = PAGE_CACHE_DIR / CACHE_SCHEMA
+    summary = {
+        "scanned": 0, "evicted": 0, "freed_bytes": 0,
+        "total_bytes": 0, "limit_bytes": limit,
+    }
+    entries = list(_iter_shard_entries(schema_root))
+    summary["scanned"] = len(entries)
+    total = _tree_bytes(PAGE_CACHE_DIR)
+    summary["total_bytes"] = total
+    if total <= limit:
+        return summary
+    protected = _manifest_keys(schema_root)
+    sizes = {entry: _tree_bytes(entry) for entry in entries}
+    candidates = sorted(
+        entries,
+        key=lambda entry: (entry.name in protected, _entry_recency(entry), entry.name),
+    )
+    for entry in candidates:
+        if total <= limit:
+            break
+        try:
+            shutil.rmtree(entry)
+        except OSError:
+            continue
+        size = sizes[entry]
+        total -= size
+        summary["evicted"] += 1
+        summary["freed_bytes"] += size
+        try:
+            entry.parent.rmdir()  # drop an emptied shard prefix
+        except OSError:
+            pass
+    summary["total_bytes"] = total
+    return summary
 
 
 @contextmanager
@@ -584,6 +716,7 @@ def _load_cached_page(key: str) -> tuple[Path, dict] | None:
             raise ValueError("cached page hash mismatch")
         if _verify_pdf(pdf, 1) != 1:
             raise ValueError("cached page is not a one-page PDF")
+        _touch_entry(entry)
         return pdf, meta
     except Exception:
         _quarantine(entry)
@@ -642,6 +775,7 @@ def _store_cached_page(
         entry / "entry.json",
         json.dumps(meta, sort_keys=True, indent=1).encode("utf-8"),
     )
+    _touch_entry(entry)
     return meta
 
 
@@ -657,16 +791,21 @@ def _embedded_pdf_present(source: Path, page_info: Sequence[dict]) -> bool:
 def _searchable_cached_page(key: str, page_id: str, raw: Path, meta: dict | None,
                             hook: SearchableHook | None, work: Path,
                             budget: _WriteBudget, warnings: list[str]) -> Path | None:
-    """Validate/rebuild just the searchable artifact; raw page cache stays independent."""
-    if hook is None or meta is None:
+    """Use searchable pages even when the optional persistent cache is full.
+
+    Cache capacity must never decide whether the published PDF gets OCR. A
+    newly generated searchable page can live in per-note scratch until splice.
+    """
+    if hook is None:
         return None
     profile = str(getattr(hook, "cache_key", "searchable-v1"))
     entry = _entry_dir(key)
     target = entry / "searchable.pdf"
-    stored = meta.get("searchable") or {}
+    stored = (meta or {}).get("searchable") or {}
     try:
         if (stored.get("profile") == profile and target.stat().st_size == stored.get("size")
                 and _sha256_file(target) == stored.get("sha256") and _verify_pdf(target, 1) == 1):
+            _touch_entry(entry)
             return target
     except (OSError, ValueError, RuntimeError):
         pass
@@ -676,9 +815,12 @@ def _searchable_cached_page(key: str, page_id: str, raw: Path, meta: dict | None
             return None
         result = Path(result)
         _verify_pdf(result, 1)
+        if meta is None:
+            warnings.append("page-delta: using transient searchable page (raw cache full)")
+            return result
         if not budget.allow(result.stat().st_size + 1024):
             warnings.append(f"page-delta: searchable cache deferred ({budget.reason})")
-            return None
+            return result
         _atomic_copy(result, target)
         meta["searchable"] = {"sha256": _sha256_file(target), "size": target.stat().st_size,
                               "profile": profile}
@@ -780,6 +922,13 @@ def compile_note(
         warnings.extend(probe_warnings)
         if count <= 0:
             raise UnsupportedMapping("renderer reports no visible pages")
+        listed = {page_id for page_id, _integrity in _read_page_manifest(archive)}
+        unlisted = sorted(set(_page_entry_names(archive)) - listed)
+        if unlisted:
+            warnings.append(
+                f"page-delta: ignored {len(unlisted)} unlisted `.page` archive record(s) "
+                "not present in pageIdInfo.dat"
+            )
         page_ids = _ordered_visible_pages(archive, count, page_info)
         if _embedded_pdf_present(source, page_info):
             raise UnsupportedMapping(
@@ -812,6 +961,15 @@ def compile_note(
         searchable_paths: list[Path | None] = []
         entries: list[dict] = []
         with _cache_lock():
+            try:
+                pruned = prune_cache()
+                if pruned["evicted"]:
+                    warnings.append(
+                        f"page-delta: pruned {pruned['evicted']} cache entries "
+                        f"({pruned['freed_bytes']} bytes)"
+                    )
+            except Exception as exc:
+                warnings.append(f"page-delta: cache prune skipped ({type(exc).__name__})")
             budget = _WriteBudget()
             for index, page_id in enumerate(page_ids):
                 page = _page_bytes(archive, page_id)

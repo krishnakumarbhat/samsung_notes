@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -62,7 +63,7 @@ class PageDeltaTests(unittest.TestCase):
     """Exercise insertion, edit, corruption and failure-safe publication."""
 
     def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.tmp.name)
         self.cache = self.root / "cache"
         self.source = self.root / "wdoc"
@@ -132,6 +133,16 @@ class PageDeltaTests(unittest.TestCase):
         _output, pages, _ = self._compile()
         self.assertEqual(pages, 4)
         self.assertEqual(self.calls, [])
+
+    def test_unlisted_stored_page_record_is_ignored_when_manifest_and_cli_agree(self):
+        page_id = _uuid(5)
+        _write_source(self.source, {page_id: b"visible page"})
+        (self.source / f"{_uuid(6)}.page").write_bytes(b"stale unlisted record")
+        output, pages, warnings = self._compile()
+        self.assertEqual(pages, 1)
+        self.assertTrue(output.is_file())
+        self.assertEqual(self.calls, [page_id])
+        self.assertTrue(any("unlisted" in warning for warning in warnings))
 
     def _entry_for(self, page_id: str) -> Path:
         """Find the cache entry directory for a page UUID."""
@@ -241,6 +252,40 @@ class PageDeltaTests(unittest.TestCase):
         self.assertEqual(seen, [a])
 
 
+    def test_full_raw_cache_does_not_disable_searchable_output(self) -> None:
+        a = _uuid(52)
+        _write_source(self.source, {a: b"A"})
+        work = self.root / "work"
+        seen = []
+
+        def hook(raw: Path, page_id: str, directory: Path) -> Path:
+            seen.append(page_id)
+            target = directory / "transient-searchable.pdf"
+            target.write_bytes(raw.read_bytes())
+            return target
+
+        with patch.object(pd._WriteBudget, "allow", return_value=False):
+            pd.compile_note(self.source, work, searchable_hook=hook)
+        self.assertEqual(seen, [a])
+        self.assertTrue((work / "page-delta-searchable.pdf").is_file())
+        self.assertEqual(list(self.cache.rglob("entry.json")), [])
+
+    def test_full_searchable_cache_uses_transient_ocr_page(self) -> None:
+        a = _uuid(53)
+        _write_source(self.source, {a: b"A"})
+        self._compile()
+        work = self.root / "work"
+
+        def hook(raw: Path, page_id: str, directory: Path) -> Path:
+            target = directory / "transient-searchable.pdf"
+            target.write_bytes(raw.read_bytes())
+            return target
+
+        with patch.object(pd._WriteBudget, "allow", return_value=False):
+            pd.compile_note(self.source, work, searchable_hook=hook)
+        self.assertTrue((work / "page-delta-searchable.pdf").is_file())
+
+
     def test_stale_note_manifest_is_replaced_atomically(self) -> None:
         a, b = _uuid(61), _uuid(62)
         _write_source(self.source, {a: b"A", b: b"B"})
@@ -286,6 +331,143 @@ class PageDeltaTests(unittest.TestCase):
         _output, pages, warnings = self._compile()
         self.assertEqual(pages, 1)
         self.assertTrue(any("flowing text" in warning for warning in warnings))
+
+
+class CachePruneTests(unittest.TestCase):
+    """Exercise bounded, cache-only LRU/orphan eviction."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self.tmp.name)
+        self.cache = self.root / "cache"
+        self.patches = [
+            patch.object(pd, "PAGE_CACHE_DIR", self.cache),
+            patch.object(pd, "PROJECT_ROOT", self.root),
+            patch.object(pd, "PAGE_CACHE_LIMIT_BYTES", 10**12),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self) -> None:
+        for item in reversed(self.patches):
+            item.stop()
+        self.tmp.cleanup()
+
+    def _entry(self, key: str, *, used_ns: int | None = None,
+               size: int = 1024) -> Path:
+        """Create a cache-owned SHA256 shard entry with synthetic metadata."""
+        entry = self.cache / pd.CACHE_SCHEMA / key[:2] / key
+        entry.mkdir(parents=True, exist_ok=True)
+        payload = b"x" * size
+        (entry / "page.pdf").write_bytes(payload)
+        meta = {
+            "schema": pd.CACHE_SCHEMA, "key": key, "page_uuid": "orphan",
+            "sha256": pd._sha256_bytes(payload), "size": size,
+            "created": "2020-01-01T00:00:00Z", "searchable": None,
+        }
+        (entry / "entry.json").write_text(json.dumps(meta))
+        if used_ns is not None:
+            stamp = used_ns / 1_000_000_000
+            os.utime(entry, (stamp, stamp))
+        return entry
+
+    def _manifest(self, note_key: str, keys: list[str], **overrides) -> Path:
+        """Write a per-note manifest referencing the given page keys."""
+        notes = self.cache / pd.CACHE_SCHEMA / "notes"
+        notes.mkdir(parents=True, exist_ok=True)
+        path = notes / f"{note_key}.json"
+        data = {
+            "schema": pd.CACHE_SCHEMA, "note_key": note_key, "count": len(keys),
+            "pages": [{"uuid": f"u{i}", "key": key, "sha256": "0" * 64}
+                      for i, key in enumerate(keys)],
+        }
+        data.update(overrides)
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_under_limit_preserves_referenced_and_orphan_entries(self) -> None:
+        key = pd._sha256_bytes(b"real")
+        entry = self._entry(key)
+        self._manifest("a" * 64, [key])
+        orphan = self._entry(pd._sha256_bytes(b"orphan"))
+        summary = pd.prune_cache()
+        self.assertEqual(summary["evicted"], 0)
+        self.assertTrue(entry.is_dir())
+        self.assertTrue(orphan.is_dir())
+
+    def test_over_limit_evicts_orphans_before_lru_referenced_entries(self) -> None:
+        real_old, real_new = (pd._sha256_bytes(f"real-{i}".encode()) for i in range(2))
+        orphan_old, orphan_new = (pd._sha256_bytes(f"orphan-{i}".encode()) for i in range(2))
+        r_old = self._entry(real_old, used_ns=1_000_000_000)
+        r_new = self._entry(real_new, used_ns=3_000_000_000)
+        o_old = self._entry(orphan_old, used_ns=1_500_000_000)
+        o_new = self._entry(orphan_new, used_ns=2_000_000_000)
+        self._manifest("b" * 64, [real_old, real_new])
+        current = pd._tree_bytes(self.cache)
+        summary = pd.prune_cache(max_bytes=current - pd._tree_bytes(o_old)
+                                 - pd._tree_bytes(o_new))
+        self.assertEqual(summary["evicted"], 2)
+        self.assertFalse(o_old.exists())
+        self.assertFalse(o_new.exists())
+        self.assertTrue(r_old.is_dir())
+        self.assertTrue(r_new.is_dir())
+
+    def test_over_limit_evicts_least_recently_used_referenced_entry(self) -> None:
+        old, new = pd._sha256_bytes(b"old"), pd._sha256_bytes(b"new")
+        stale = self._entry(old, used_ns=1_000_000_000)
+        fresh = self._entry(new, used_ns=3_000_000_000)
+        self._manifest("c" * 64, [old, new])
+        current = pd._tree_bytes(self.cache)
+        summary = pd.prune_cache(max_bytes=current - pd._tree_bytes(stale))
+        self.assertEqual(summary["evicted"], 1)
+        self.assertFalse(stale.exists())
+        self.assertTrue(fresh.is_dir())
+
+    def test_invalid_manifests_and_foreign_paths_are_never_deleted(self) -> None:
+        key = pd._sha256_bytes(b"unprotected")
+        entry = self._entry(key)
+        self._manifest("d" * 64, [key], schema="wrong-schema")
+        outside = self.root / "user.pdf"
+        outside.write_bytes(b"keep me")
+        foreign = self.cache / pd.CACHE_SCHEMA / "nothex" / ("g" * 64)
+        foreign.mkdir(parents=True)
+        (foreign / "keep.txt").write_text("keep")
+        summary = pd.prune_cache(max_bytes=0)
+        self.assertGreater(summary["evicted"], 0)
+        self.assertFalse(entry.exists())
+        self.assertTrue(outside.is_file())
+        self.assertTrue((foreign / "keep.txt").is_file())
+        self.assertTrue((self.cache / pd.CACHE_SCHEMA / "notes").is_dir())
+
+    def test_compile_note_prunes_orphans_before_budget_check(self) -> None:
+        stale_key = pd._sha256_bytes(b"stale")
+        stale = self._entry(stale_key, size=200_000)
+        current = pd._tree_bytes(self.cache)
+        limit = current - pd._tree_bytes(stale) + 100_000
+        page_id = "00000000-0000-0000-0000-000000000091"
+        sources = self.root / "wdoc"
+        sources.mkdir(parents=True)
+        (sources / f"{page_id}.page").write_bytes(b"A")
+        manifest = b"\0" * 32 + struct.pack("<H", 1)
+        units = page_id.encode("utf-16-le")
+        manifest += struct.pack("<H", len(units) // 2) + units + b"\0" * 32
+        (sources / "pageIdInfo.dat").write_bytes(manifest)
+        def render(archive, index, page_id, output, warnings):
+            pdf = pikepdf.Pdf.new()
+            pdf.add_blank_page()
+            pdf.save(output)
+
+        with patch.object(pd, "_probe_archive", lambda archive: (
+                1, [{"index": 0, "template": "blank", "strokes": 1}], [])), \
+             patch.object(pd, "_render_page_pdf", render), \
+             patch.object(pd, "_content_pages", lambda *args: 0), \
+             patch.object(pd, "_splice_pages", lambda *args: None), \
+             patch.object(pd, "_renderer_config", lambda: {"test": "renderer"}), \
+             patch.object(pd, "PAGE_CACHE_LIMIT_BYTES", limit):
+            output, pages, warnings = pd.compile_note(sources, self.root / "work")
+        self.assertEqual(pages, 1)
+        self.assertFalse(stale.exists())
+        self.assertFalse(any("fallback" in warning for warning in warnings))
 
 
 if __name__ == "__main__":

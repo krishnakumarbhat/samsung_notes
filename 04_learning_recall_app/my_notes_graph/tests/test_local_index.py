@@ -25,7 +25,7 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = APP_ROOT.parents[1]
 sys.path.insert(0, str(APP_ROOT))
 for site in (
-    PROJECT_ROOT / "05_environments_and_venvs/python_ocr_env/site-packages",
+    PROJECT_ROOT.parent / "python_libs_gpu/site-packages",
     PROJECT_ROOT.parent / "python_libs/site-packages",
 ):
     if site.is_dir():
@@ -67,6 +67,10 @@ def _digest(path: Path) -> str:
 
 class LocalIndexTests(unittest.TestCase):
     """Verify status accounting, incremental replacement, citations and scoping."""
+
+    def test_root_note_has_no_invented_uncategorized_folder(self):
+        self.assertEqual(local_index._folder_of("Root note__00000000.pdf"), "")
+        self.assertEqual(local_index._folder_of("maths/Root note__00000000.pdf"), "maths")
 
     def setUp(self) -> None:
         local_index.reset_embedder()

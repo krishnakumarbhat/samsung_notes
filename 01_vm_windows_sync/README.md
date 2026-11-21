@@ -46,11 +46,11 @@ The first boot starts the Windows installer. Complete the installation manually.
 4. Install **Samsung Notes** from the Microsoft Store and sign in.
 5. Open Samsung Notes, review and accept Terms/Privacy manually.
 6. Keep the session unlocked; disable sleep, hibernation and Fast Startup.
-7. Install Python at `C:\py\python.exe` (the inventory helper calls it). The
-   bundled `guestsetup/pyembed.zip`, `get-pip.py` and `py.bat` are the original
-   bootstrap helpers.
-8. Install the WebView2 runtime if Samsung Notes requires it
-   (`guestsetup/wv2.exe`).
+7. Provision Python at `C:\py\python.exe`; the guest inventory helper uses that
+   preinstalled interpreter. Legacy embedded-Python and installer binaries are
+   not tracked in this repository.
+8. Install the WebView2 runtime through the guest's supported Windows installer
+   if Samsung Notes requires it; no installer binary is bundled here.
 9. Verify the tray app starts at login and the note list renders.
 10. From the host, run:
     ```bash

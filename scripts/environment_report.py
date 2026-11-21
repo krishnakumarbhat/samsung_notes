@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import platform
 import subprocess
 import sys
@@ -76,8 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     external = {
         "python_libs": ROOT.parent / "python_libs/site-packages",
         "python_libs_gpu": ROOT.parent / "python_libs_gpu/site-packages",
-        "ocr_site_packages": ROOT / "05_environments_and_venvs/python_ocr_env/site-packages",
-        "shared_venv": Path.home() / ".cache/sam_win/venv",
+        "sam_notes_scratch_root": ROOT.parent / "sam_notes",
     }
     payload = {
         "schema": 1,

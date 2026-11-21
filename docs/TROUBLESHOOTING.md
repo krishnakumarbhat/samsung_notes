@@ -125,15 +125,21 @@ Log out/in if needed. Without KVM the VM still boots under TCG but is very slow.
 
 ### `Missing SAMSUNG_NOTES_PASSWORD`
 
-Create `02_extracted_notes_pdf/.env`:
+Store the guest credential on the native Linux filesystem (not the NTFS/FUSE
+workspace, where `chmod 600` may not persist):
 
 ```bash
-printf 'SAMSUNG_NOTES_PASSWORD=your-guest-password\n' > 02_extracted_notes_pdf/.env
-chmod 600 02_extracted_notes_pdf/.env
+install -d -m 700 ~/.config/sam_win
+touch ~/.config/sam_win/.env
+chmod 600 ~/.config/sam_win/.env
+# Add SAMSUNG_NOTES_PASSWORD=<guest password> with a secure editor; do not echo it.
 ```
 
-The password belongs to the Windows user `notes`, not your Samsung account.
-The automation passes it through `SSHPASS` so it never appears in `argv`.
+The guest sync and export tools read `~/.config/sam_win/.env` first, falling
+back to `02_extracted_notes_pdf/.env` only when the native file has no guest
+credential key. The password belongs to the Windows user `notes`, not the
+Samsung account. It is passed through `SSHPASS`, never argv or logs. Rotate it
+if it has not changed since the earlier sync failures.
 
 ### `Windows VM SSH did not become ready within 120 seconds`
 
@@ -163,6 +169,34 @@ space does **not** mean deleting notes. Options:
 - Archive `preserved_originals/` to external storage.
 - Remove regenerable caches (`page_cache/`, `ocr_visual_cache/`).
 - Raise the documented cap deliberately; never bypass the free-space floor.
+
+### Folder move causes a full export
+
+The Phase 0 UUID tree reconciler runs after guest sync quiescence. It reads the
+guest `Storage.sqlite` through `mode=ro` and `PRAGMA query_only=ON`, then matches
+local PDFs by UUID, manifest path and verified digest. A folder rename/move with
+an unchanged UUID and content should only update local paths; it must not render,
+OCR or re-embed. Review its private report under
+`02_extracted_notes_pdf/ai_agend_history/reconcile_tree.*.json`. Conflicts,
+deleted notes and unknown PDFs are archived, not silently deleted. Never edit
+the guest database to repair local paths. The current storage mode is
+compressed-only: `notes/compressed/` is the canonical store; do not create or
+populate `notes/original/`. Existing legacy originals are archived safely.
+
+### OCR imports fail after moving the environment
+
+Python packages are loaded only from sibling `../python_libs_gpu/` and
+`../python_libs/`. Source the runtime resolver before manual commands:
+
+```bash
+source 00_orchestrator/runtime.sh
+python3 -c 'import fitz, pikepdf, paddleocr; print("runtime OK")'
+```
+
+Transient staging, Paddle, Matplotlib, CUDA and OCR-visual caches use a
+per-process `../sam_notes/_run_tmp_<pid>/` directory that is removed on exit;
+the page-delta cache remains under `ai_agend_history/page_cache/` and is
+automatically pruned to its configured limit.
 
 ### Sync says `IsDirty` never reaches zero
 

@@ -47,15 +47,18 @@ Current corpus result: 272 PDFs / 9,080 pages; sparse pages fell from 399 to
 ## Run a selected target
 
 ```bash
-python3 paddle_cuda_probe.py
-python3 paddle_ocr_pdf_batch.py /path/to/one-note.pdf --device gpu --output-dir /tmp/ocr-test
+source 00_orchestrator/runtime.sh
+python3 scripts/doctor.py --mode ocr
+python3 03_rtx_compression_ocr/paddle_ocr_pdf_batch.py \
+  /path/to/one-note.pdf --device gpu --output-dir "$TMPDIR/ocr-test"
 ```
 
 For a deliberately selected directory, the relative folder hierarchy is
 preserved in the output directory:
 
 ```bash
-python3 paddle_ocr_pdf_batch.py /path/to/selected-pdfs --device gpu --output-dir /tmp/ocr-test
+python3 03_rtx_compression_ocr/paddle_ocr_pdf_batch.py \
+  /path/to/selected-pdfs --device gpu --output-dir "$TMPDIR/ocr-test"
 ```
 
 Do not pass the entire Samsung Notes library for validation. The incremental

@@ -11,21 +11,18 @@ source "$PROJECT_ROOT/00_orchestrator/runtime.sh"
 PYTHON="$OPENCODE_PYTHON"
 GPU_SITE="$PROJECT_ROOT/../python_libs_gpu/site-packages"
 CPU_SITE="$PROJECT_ROOT/../python_libs/site-packages"
-OCR_SITE="$PROJECT_ROOT/05_environments_and_venvs/python_ocr_env/site-packages"
 
 PYTHONPATH_PREFIX=()
-for directory in "$GPU_SITE" "$OCR_SITE" "$CPU_SITE"; do
+for directory in "$GPU_SITE" "$CPU_SITE"; do
   [[ -d "$directory" ]] && PYTHONPATH_PREFIX+=("$directory")
 done
-for directory in "$APP_DIR"/.venv/lib/python*/site-packages; do
-  [[ -d "$directory" ]] && PYTHONPATH_PREFIX+=("$directory")
-done
-PYTHONPATH="$(IFS=:; printf '%s' "${PYTHONPATH_PREFIX[*]}")${PYTHONPATH:+:$PYTHONPATH}"
+PYTHONPATH="$(IFS=:; printf '%s' "${PYTHONPATH_PREFIX[*]}")"
 export PYTHONPATH
+export PYTHONNOUSERSITE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=2
 
 LD_PATHS=()
-for directory in "$GPU_SITE"/nvidia/*/lib "$CPU_SITE"/nvidia/*/lib "$OCR_SITE"/nvidia/*/lib "$OCR_SITE"/*.libs; do
+for directory in "$GPU_SITE"/nvidia/*/lib "$CPU_SITE"/nvidia/*/lib "$GPU_SITE"/*.libs "$CPU_SITE"/*.libs; do
   [[ -d "$directory" ]] && LD_PATHS+=("$directory")
 done
 if ((${#LD_PATHS[@]})); then
@@ -59,8 +56,8 @@ if curl -fsS http://127.0.0.1:8787/api/health >/dev/null 2>&1; then
 fi
 
 cd "$APP_DIR"
-BIND_HOST="${RECALL_HOST:-0.0.0.0}"
-setsid nohup "$PYTHON" -m uvicorn 00_main:app --host "$BIND_HOST" --port 8787 --workers 1 \
+BIND_HOST="${RECALL_HOST:-127.0.0.1}"
+setsid nohup env TMPDIR=/tmp/opencode "$PYTHON" -m uvicorn 00_main:app --host "$BIND_HOST" --port 8787 --workers 1 \
   >>"$LOG_FILE" 2>&1 </dev/null &
 echo "$!" > "$PID_FILE"
 for _ in $(seq 1 60); do

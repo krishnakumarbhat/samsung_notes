@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Bootstrap custom Python library roots used by the OCR tools.
-
-The local machine stores large OCR dependencies under the project drive instead
-of the root filesystem. These helpers make the scripts reliably pick up those
-libraries without requiring the user to export PYTHONPATH manually.
-"""
+"""Bootstrap the shared CPU/GPU Python library roots used by OCR tools."""
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import site
 import sys
@@ -39,40 +33,17 @@ def _get_script_project_root(script_path: Path) -> Path | None:
     return None
 
 
-def _has_module(module_name: str) -> bool:
-    return importlib.util.find_spec(module_name) is not None
-
-
 def get_candidate_library_roots(script_path: Path | None = None) -> list[Path]:
+    """Return only the consolidated GPU and CPU site-package roots."""
     script_path = script_path or Path(__file__).resolve()
-    candidates: list[Path] = []
     preferred_variant = os.environ.get("SAM_PDF_PADDLE_VARIANT", "auto").strip().lower()
-    needs_ocr_fallback = not (_has_module("paddleocr") and _has_module("paddlex"))
-
-    raw_env_roots = os.environ.get("SAM_PDF_PYTHON_LIB_ROOTS") or os.environ.get("SAM_PDF_PYTHON_LIBS")
-    if raw_env_roots:
-        for raw_path in raw_env_roots.split(os.pathsep):
-            raw_path = raw_path.strip()
-            if raw_path:
-                candidates.append(Path(raw_path).expanduser())
-
     project_root = _get_script_project_root(script_path)
-    if project_root is not None:
-        ocr_root = project_root / "05_environments_and_venvs/python_ocr_env"
-        shared_root = project_root.parent
-        gpu_root = shared_root / "python_libs_gpu"
-        cpu_root = shared_root / "python_libs"
-
-        if preferred_variant == "cpu":
-            candidates.append(ocr_root)
-            if needs_ocr_fallback:
-                candidates.append(cpu_root)
-        else:
-            candidates.append(gpu_root)
-            candidates.append(ocr_root)
-            if needs_ocr_fallback:
-                candidates.append(cpu_root)
-
+    if project_root is None:
+        return []
+    shared_root = project_root.parent
+    gpu_root = shared_root / "python_libs_gpu"
+    cpu_root = shared_root / "python_libs"
+    candidates = [cpu_root] if preferred_variant == "cpu" else [gpu_root, cpu_root]
     return [path for path in _dedupe_paths(candidates) if path.exists()]
 
 

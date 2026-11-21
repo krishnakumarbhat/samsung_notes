@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -33,12 +34,46 @@ class NativeTextPage:
 class PdfPipelineTests(unittest.TestCase):
     """Verify OCR bypass rules and ensure OCR-layer/compression are lossless."""
 
-    def test_native_page_bypasses_only_at_fifty_clean_characters(self):
-        self.assertFalse(page_has_native_text(NativeTextPage("x" * 49)))
+    def test_explicit_gpu_request_never_silently_uses_cpu(self):
+        with patch.object(pipeline, "detect_gpu_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "refusing silent CPU fallback"):
+                pipeline.build_ocr("en", "gpu", 2560, False, 8)
+
+    def test_missing_local_models_never_trigger_downloads(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+            script = Path(temporary) / "ocr/pipeline.py"
+            with patch.object(pipeline, "__file__", str(script)), \
+                 patch.object(pipeline, "detect_gpu_available", return_value=True), \
+                 patch.object(pipeline, "detect_gpu_memory_mb", return_value=(4096, 3000)), \
+                 patch.object(pipeline, "PaddleOCR") as constructor:
+                with self.assertRaisesRegex(RuntimeError, "automatic downloads disabled"):
+                    pipeline.build_ocr("en", "gpu", 2560, False, 8)
+                constructor.assert_not_called()
+
+    def test_failed_local_model_init_is_not_retried_with_remote_defaults(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+            root = Path(temporary)
+            for name in ("PP-OCRv5_mobile_det", "PP-OCRv5_server_rec"):
+                directory = root / "05_environments_and_venvs/models/paddleocr" / name
+                directory.mkdir(parents=True)
+                (directory / "inference.pdiparams").write_bytes(b"test fixture")
+            with patch.object(pipeline, "__file__", str(root / "ocr/pipeline.py")), \
+                 patch.object(pipeline, "detect_gpu_available", return_value=True), \
+                 patch.object(pipeline, "detect_gpu_memory_mb", return_value=(4096, 3000)), \
+                 patch.object(pipeline, "PaddleOCR", side_effect=ValueError("model init")) as constructor:
+                with self.assertRaisesRegex(ValueError, "model init"):
+                    pipeline.build_ocr("en", "gpu", 2560, False, 8)
+                constructor.assert_called_once()
+                self.assertEqual(constructor.call_args.kwargs["device"], "gpu:0")
+                self.assertIn("text_recognition_model_dir", constructor.call_args.kwargs)
+
+    def test_existing_searchable_text_bypasses_ocr_even_when_short(self):
+        self.assertTrue(page_has_native_text(NativeTextPage("x" * 49)))
         self.assertTrue(page_has_native_text(NativeTextPage("x" * 50)))
         self.assertTrue(page_has_native_text(NativeTextPage("x" * 25 + "\x00" * 50 + "y" * 25)))
-        # A spaced-out title page must not count as text rich.
-        self.assertFalse(page_has_native_text(NativeTextPage("x " * 30)))
+        self.assertTrue(page_has_native_text(NativeTextPage("x " * 30)))
+        self.assertTrue(page_has_native_text(NativeTextPage("Title")))
+        self.assertFalse(page_has_native_text(NativeTextPage(" \x00\n")))
 
     def test_rotated_ocr_boxes_map_back_onto_the_upright_page(self):
         """Quarter-turn variants are inverted before invisible text is placed."""
@@ -66,7 +101,7 @@ class PdfPipelineTests(unittest.TestCase):
         doc.close()
 
     def test_lossless_compression_preserves_text_and_render(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             root = Path(temporary)
             source, output = root / "source.pdf", root / "compressed.pdf"
             doc = fitz.open()
@@ -89,7 +124,7 @@ class PdfPipelineTests(unittest.TestCase):
                 )
 
     def test_process_pdf_skips_ocr_on_text_rich_page(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             root = Path(temporary)
             source, output = root / "typed.pdf", root / "out" / "typed.pdf"
             doc = fitz.open()
@@ -110,8 +145,28 @@ class PdfPipelineTests(unittest.TestCase):
                 self.assertEqual(len(result), 1)
                 self.assertIn("native text layer", result[0].get_text())
 
+    def test_unicode_ocr_font_handling_preserves_other_pages_native_text(self):
+        """Subsetting the whole PDF for OCR on one page must not drop other text."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+            root = Path(temporary)
+            source, output = root / "mixed.pdf", root / "out" / "mixed.pdf"
+            with fitz.open() as document:
+                first = document.new_page(width=300, height=300)
+                first.insert_text((30, 50), "Native selectable page text must survive.")
+                second = document.new_page(width=300, height=300)
+                second.draw_line((20, 200), (280, 200), color=(0, 0, 0), width=2)
+                document.save(source)
+
+            polygon = [[40, 60], [200, 60], [200, 90], [40, 90]]
+            with patch.object(pipeline, "select_best_ocr_results",
+                              return_value=([(polygon, "α native-safe OCR", .99)], "fixture", 0)):
+                process_pdf(source, output, lambda: object(), 72, 1024, .6, False)
+            with fitz.open(output) as result:
+                self.assertIn("Native selectable page text", result[0].get_text())
+                self.assertIn("α native-safe OCR", result[1].get_text())
+
     def test_process_pdf_skips_a_featureless_monochrome_page(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             root = Path(temporary)
             source, output = root / "blank.pdf", root / "out" / "blank.pdf"
             doc = fitz.open()
@@ -129,7 +184,7 @@ class PdfPipelineTests(unittest.TestCase):
                 self.assertEqual(pix.samples.count(pix.samples[0]), len(pix.samples))
 
     def test_identical_rendered_pages_reuse_ocr_regions(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
             root = Path(temporary)
             fake_script = root / "pipeline.py"
             fake_script.write_text("test profile")
@@ -140,6 +195,7 @@ class PdfPipelineTests(unittest.TestCase):
                     page.draw_rect(fitz.Rect(20, 20, 100, 100), color=(0, 0, 0))
                 pdf.save(source)
             with patch.object(pipeline, "__file__", str(fake_script)), \
+                 patch.dict(os.environ, {"TMPDIR": str(root / "cache")}), \
                  patch.object(pipeline, "select_best_ocr_results", return_value=([], "original", 0)) as infer:
                 process_pdf(source, output, lambda: object(), 72, 256, .6, False)
             self.assertEqual(infer.call_count, 1)

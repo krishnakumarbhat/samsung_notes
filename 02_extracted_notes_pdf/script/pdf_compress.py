@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import io
 import json
+import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -178,8 +179,14 @@ def compress(
     dedup: bool = True,
     grayscale: bool = True,
     verify: bool = True,
+    lossless: bool = False,
 ) -> CompressionReport:
-    """Compress one PDF without changing its page geometry or image sizes."""
+    """Compress images in-place in the PDF graph; optionally forbid lossy codecs.
+
+    Lossless mode never decodes/re-encodes JPEGs. Only plain 8-bit RGB images
+    whose channels are exactly identical may be reduced to DeviceGray. Masks,
+    custom decode arrays and non-device colour spaces are left untouched.
+    """
     source, output = Path(source), Path(output)
     report = CompressionReport(str(source), str(output))
     report.source_bytes = source.stat().st_size
@@ -193,6 +200,28 @@ def compress(
             report.bytes_before_images += before
             filt = str(obj.get("/Filter"))
             report.filters_before[filt] = report.filters_before.get(filt, 0) + 1
+            if lossless:
+                unsafe = any(key in obj for key in (
+                    "/Decode", "/Mask", "/SMask", "/ImageMask", "/SMaskInData",
+                    "/Alternates", "/Intent", "/OPI"))
+                plain_rgb = (str(obj.get("/ColorSpace")) == "/DeviceRGB"
+                             and int(obj.get("/BitsPerComponent", 0)) == 8
+                             and filt in ("/FlateDecode", "None"))
+                if grayscale and plain_rgb and not unsafe:
+                    image = _decode(obj)
+                    if image is not None and _is_gray(image):
+                        payload = zlib.compress(image.convert("L").tobytes(), level=9)
+                        if len(payload) < before * (1.0 - min_saving):
+                            obj.write(payload, filter=pikepdf.Name("/FlateDecode"))
+                            obj["/ColorSpace"] = pikepdf.Name("/DeviceGray")
+                            if "/DecodeParms" in obj:
+                                del obj["/DecodeParms"]
+                            report.images_gray += 1
+                            report.images_reencoded += 1
+                report.filters_after[str(obj.get("/Filter"))] = \
+                    report.filters_after.get(str(obj.get("/Filter")), 0) + 1
+                report.bytes_after_images += _image_bytes(obj)
+                continue
             image = _decode(obj)
             if image is None:
                 continue
@@ -219,7 +248,9 @@ def compress(
         if dedup:
             for page, name, obj in _page_images(pdf):
                 try:
-                    key = _digest(obj.read_raw_bytes())
+                    # Bytes alone are NOT an identity: masks, colour spaces,
+                    # dimensions and Decode arrays all affect their meaning.
+                    key = _digest(obj.stream_dict.unparse() + b"\0" + obj.read_raw_bytes())
                 except Exception:
                     continue
                 canonical = seen.get(key)
