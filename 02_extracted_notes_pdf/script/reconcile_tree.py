@@ -708,6 +708,7 @@ class TreeReconciler:
         for uuid, target in path_map.items():
             if not uuid.endswith("_original"):
                 canonical_rel[uuid] = self.relative(target)
+        pruned_duplicate_ids: set[int] = set()
         for uuid, rows in by_uuid.items():
             if len(rows) <= 1:
                 continue
@@ -720,14 +721,19 @@ class TreeReconciler:
             if keeper is None:
                 keeper = rows[0]
             for row in rows:
-                if row["id"] != keeper["id"] and row["status"] != "inactive":
-                    updates["index_inactive"].append({"id": row["id"]})
-        # Drop path/source updates for pruned rows to avoid UNIQUE collisions on source.
+                if row["id"] != keeper["id"]:
+                    pruned_duplicate_ids.add(row["id"])
+                    if row["status"] != "inactive":
+                        updates["index_inactive"].append({"id": row["id"]})
+        # Drop path/source updates for every non-keeper duplicate row, including
+        # rows that were already inactive: repathing them would collide with the
+        # canonical source that the active keeper already owns.
         pruned_ids = {
             item["id"]
             for item in updates["index_inactive"]
             if isinstance(item, dict) and "id" in item
         }
+        pruned_ids.update(pruned_duplicate_ids)
         updates["index_path"] = [
             u for u in updates["index_path"] if u.get("id") not in pruned_ids
         ]

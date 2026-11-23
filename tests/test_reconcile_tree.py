@@ -658,6 +658,39 @@ def test_local_index_duplicate_rows_pruned_to_one_active_per_uuid(
     assert _learning_rows(ws) == (before_fsrs, before_elo)
 
 
+def test_inactive_duplicate_row_is_not_repathed_into_collision(
+    ws: SimpleNamespace, inventory: dict
+) -> None:
+    """A pre-existing inactive stale row must not be repathed onto the canonical source."""
+    canonical = ws.compressed / "maths/04. Analysis" / f"Graph Analysis__{U1}.pdf"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(_pdf("v1"))
+    good = _sha(_pdf("v1"))
+    _seed_databases(ws, [{"uuid": U1, "path": str(canonical), "sha": good}])
+    stale_source = f"legacy/Graph Analysis__{U1}.pdf"
+    with _connect(ws.index_db) as connection:
+        connection.execute(
+            "INSERT INTO sources(id,source,path,folder,sha256,status,indexed_at) "
+            "VALUES(2,?,?,?,?,?,?)",
+            (stale_source, "/gone/" + stale_source, "legacy", good, "inactive", 1.0),
+        )
+    _write_manifest(ws, [
+        {"uuid": U1, "path": str(canonical), "sha256": good, "derived_sha256": good},
+    ])
+    # Would raise a collision error before the fix because the inactive row's
+    # source falls back to the canonical path the active keeper already owns.
+    _reconciler(ws, inventory).run(apply=True)
+    with _connect(ws.index_db) as connection:
+        rows = connection.execute(
+            "SELECT id,source,status FROM sources ORDER BY id"
+        ).fetchall()
+        active = connection.execute(
+            "SELECT COUNT(*) FROM sources WHERE status='indexed'"
+        ).fetchone()[0]
+    assert rows[1] == (2, stale_source, "inactive")
+    assert active == 1
+
+
 def test_unmapped_symlink_is_archived_not_dropped(
     ws: SimpleNamespace, inventory: dict
 ) -> None:

@@ -392,13 +392,30 @@ def derive_file(source: Path, *, target: Path | None = None, ocr: bool = False,
         base = source
         if ocr and sparse:
             from paddle_ocr_pdf_batch import process_pdf
-            base = work / "searchable.pdf"
+            searchable = work / "searchable.pdf"
             with (HISTORY / "gpu_ocr.lock").open("w") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
-                process_pdf(source, base, ocr_engine, dpi=300, ocr_max_side_len=2560,
+                process_pdf(source, searchable, ocr_engine, dpi=300, ocr_max_side_len=2560,
                             min_score=.6, force_ocr=False)
-            verify_pair(source, base)
-            did_ocr = True
+            with fitz.open(searchable) as derived:
+                after_chars = sum(len(page.get_text().strip()) for page in derived)
+            if after_chars <= native_chars:
+                # OCR inserted no text: the reserialized no-op must not fail the
+                # visible-content guard. Keep the exact source bytes instead.
+                warnings.append("OCR added no text; kept source bytes")
+            else:
+                try:
+                    verify_pair(source, searchable)
+                except ValueError as exc:
+                    if "lost native text" not in str(exc):
+                        raise
+                    # The OCR overlay would hide native text. Source bytes are
+                    # lossless and keep every visible page searchable where the
+                    # note already carries text; discard only the OCR layer.
+                    warnings.append("OCR would lose native text; kept source bytes")
+                else:
+                    base = searchable
+                    did_ocr = True
         from pdf_compress import compress as compress_pdf
         candidate = work / "optimized.pdf"
         try:

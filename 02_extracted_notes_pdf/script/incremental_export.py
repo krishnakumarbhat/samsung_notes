@@ -998,7 +998,7 @@ def _export_note(state: sqlite3.Connection, work: Path, note: dict,
         if result.get("status") not in ("searchable", "no_text"):
             raise RuntimeError(f"derive status {result.get('status')}")
         if ocr_requested and int(result.get("sparse_pages", 0)) > 0 \
-                and not result.get("ocr"):
+                and not result.get("ocr") and int(result.get("chars", 0)) == 0:
             raise RuntimeError("OCR requested but no page was recognized")
         if target.is_symlink() or not target.is_file():
             raise ValueError("derived output is not a real file")
