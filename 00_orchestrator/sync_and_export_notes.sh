@@ -19,6 +19,8 @@ EXPORT_FLAG="$SAM_ROOT/temp/export_active.flag"
 exec 9>"$HISTORY/orchestrator.lock"
 flock -n 9 || { echo 'Another sync/export run owns the workspace lock.' >&2; exit 1; }
 rm -f "$EXPORT_FLAG"   # clear any stale flag from a previous run
+# With the workspace lock held, reclaim abandoned scratch from dead runs only.
+if declare -F sam_sweep_run_tmp >/dev/null 2>&1; then sam_sweep_run_tmp; fi
 
 # Preflight: GPU runtime, disk, dependencies — all before any VM start.
 DRY=0
@@ -82,7 +84,8 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
-trap 'echo "Interrupted; running cleanup..." >&2; exit 130' INT TERM
+trap 'echo "Interrupted; running cleanup..." >&2; exit 130' INT
+trap 'echo "Terminated; running cleanup..." >&2; exit 143' TERM
 
 if (( DRY )); then
   echo "== DRY-RUN: skipping VM, guest sync, export, postprocess, index, app =="

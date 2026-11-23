@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -44,10 +45,47 @@ SYNC_RECHECK_PASSES = 3
 
 
 SAM_NOTES_ROOT = Path(os.environ.get("SAM_NOTES_ROOT", str(PROJECT_ROOT.parent / "sam_notes"))).expanduser()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from scripts.run_tmp_cleanup import (  # noqa: E402  (path set above)
+    remove_owned_run_tmp,
+    sweep as sweep_run_tmps,
+)
+
 _OWNS_RUN_ROOT = not os.environ.get("SN_EXPORT_WORK")
 DEFAULT_RUN_ROOT = SAM_NOTES_ROOT / f"_run_tmp_{os.getpid()}"
-if _OWNS_RUN_ROOT:
-    atexit.register(shutil.rmtree, DEFAULT_RUN_ROOT, ignore_errors=True)
+
+
+def _cleanup_owned_run_root() -> None:
+    """Remove this run's scratch only while the encoded pid still owns it."""
+    if _OWNS_RUN_ROOT:
+        remove_owned_run_tmp(DEFAULT_RUN_ROOT, os.getpid(), SAM_NOTES_ROOT)
+
+
+def _install_run_tmp_lifecycle() -> None:
+    """Clean scratch on exit, SIGINT and SIGTERM, then re-raise the signal."""
+    atexit.register(_cleanup_owned_run_root)
+    if not _OWNS_RUN_ROOT:
+        return
+
+    def _make_handler(previous):
+        def _handler(signum: int, _frame) -> None:
+            _cleanup_owned_run_root()
+            signal.signal(signum, previous if previous not in (None, signal.SIG_IGN)
+                          else signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        return _handler
+
+    for number in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(number, _make_handler(signal.getsignal(number)))
+
+
+def _sweep_stale_run_roots() -> None:
+    """Reclaim abandoned scratch from dead runs; live locks/pids are spared."""
+    try:
+        sweep_run_tmps(SAM_NOTES_ROOT, exclude_pids={os.getpid()})
+    except (OSError, ValueError):
+        pass
 
 
 # Raw note payloads and rendered candidates are transient external scratch; a
@@ -1478,6 +1516,8 @@ def repair(apply: bool = False) -> int:
 
 
 if __name__ == "__main__":
+    _install_run_tmp_lifecycle()
+    _sweep_stale_run_roots()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int)

@@ -4,6 +4,7 @@ SAM_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 SAM_NOTES_ROOT="$(dirname -- "$SAM_ROOT")/sam_notes"
 mkdir -p "$SAM_NOTES_ROOT"
 export SAM_NOTES_ROOT
+RUN_TMP_CLEANER="$SAM_ROOT/scripts/run_tmp_cleanup.py"
 if [[ -z "${SAM_RUN_TMP:-}" ]]; then
   SAM_RUN_TMP="$(mktemp -d "$SAM_NOTES_ROOT/_run_tmp_$$.XXXXXX")"
   SAM_RUN_TMP_OWNER_PID="$BASHPID"
@@ -12,18 +13,45 @@ if [[ -z "${SAM_RUN_TMP:-}" ]]; then
 else
   SAM_RUN_TMP_OWNED=0
 fi
+# Hold an exclusive owner lock for this run's lifetime. A concurrent sweeper
+# treats a held lock as proof of a live run and leaves the directory alone.
+if (( SAM_RUN_TMP_OWNED )) && [[ ! -L "$SAM_RUN_TMP" ]]; then
+  : > "$SAM_RUN_TMP/.owner.lock" 2>/dev/null || true
+  exec {SAM_RUN_TMP_LOCK_FD}>"$SAM_RUN_TMP/.owner.lock" 2>/dev/null || SAM_RUN_TMP_LOCK_FD=""
+  if [[ -n "${SAM_RUN_TMP_LOCK_FD:-}" ]]; then
+    flock -n "$SAM_RUN_TMP_LOCK_FD" 2>/dev/null || true
+  fi
+fi
 sam_cleanup_run_tmp() {
   if [[ "${SAM_RUN_TMP_OWNER_PID:-}" == "${BASHPID:-$$}" \
-        && "${SAM_RUN_TMP:-}" == "$SAM_NOTES_ROOT"/_run_tmp_* ]]; then
-    rm -rf -- "$SAM_RUN_TMP"
+        && "${SAM_RUN_TMP:-}" == "$SAM_NOTES_ROOT"/_run_tmp_* \
+        && ! -L "${SAM_RUN_TMP:-}" ]]; then
+    if [[ -f "$RUN_TMP_CLEANER" && -n "${OPENCODE_PYTHON:-}" ]]; then
+      "$OPENCODE_PYTHON" "$RUN_TMP_CLEANER" --notes-root "$SAM_NOTES_ROOT" \
+        --own "$SAM_RUN_TMP" --own-pid "$BASHPID" >/dev/null 2>&1 || true
+    else
+      rm -rf -- "$SAM_RUN_TMP"
+    fi
   fi
 }
-if (( SAM_RUN_TMP_OWNED )); then trap sam_cleanup_run_tmp EXIT; fi
+# Reclaim only abandoned runs; live pids, held locks and fresh trees survive.
+sam_sweep_run_tmp() {
+  [[ -f "$RUN_TMP_CLEANER" && -n "${OPENCODE_PYTHON:-}" ]] || return 0
+  "$OPENCODE_PYTHON" "$RUN_TMP_CLEANER" --notes-root "$SAM_NOTES_ROOT" \
+    --exclude-pid "$BASHPID" >/dev/null 2>&1 || true
+  return 0
+}
+if (( SAM_RUN_TMP_OWNED )); then
+  trap sam_cleanup_run_tmp EXIT
+  trap 'sam_cleanup_run_tmp; exit 130' INT
+  trap 'sam_cleanup_run_tmp; exit 143' TERM
+fi
 if [[ -z "${OPENCODE_PYTHON:-}" ]]; then
     for py in "${SAM_PYTHON:-}" "${SAM_VENV:+$SAM_VENV/bin/python3}" "$SAM_ROOT/.venv/bin/python3" "$SAM_ROOT/../.shared_venv/bin/python3" "$HOME/.cache/opencode_shared_venv/bin/python3" /usr/bin/python3; do
     if [[ -n "$py" && -x "$py" ]]; then export OPENCODE_PYTHON="$py"; break; fi
   done
 fi
+sam_sweep_run_tmp
 GPU_SITE="$SAM_ROOT/../python_libs_gpu/site-packages"
 CPU_SITE="$SAM_ROOT/../python_libs/site-packages"
 export PYTHONNOUSERSITE=1
